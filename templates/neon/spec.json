@@ -1,0 +1,71 @@
+{
+  "name": "Neon",
+  "description": "Purple neon theme with wheel, bars, and hexagon designs",
+  "file": "template.pptx",
+  "total_slides": 20,
+  "min_slides": 6,
+  "max_slides": 30,
+  "sections": {
+    "start": {"slide": 1},
+    "wheel": {"slides": [2, 3, 4], "count": 3},
+    "bars": {"slides": [5, 6, 7, 8, 9, 10, 11, 12, 13], "count": 9},
+    "hexagon": {"slides": [14, 15, 16, 17, 18, 19], "count": 6},
+    "end": {"slide": 20}
+  },
+  "placeholders": {
+    "start": {
+      "AI_title": {"max_chars": 20, "single_line": true},
+      "AI_subtitle": {"max_chars": 30, "single_line": true}
+    },
+    "wheel": {
+      "AI_tag_1": {"max_chars": 14, "single_line": true},
+      "AI_tag_2": {"max_chars": 14, "single_line": true},
+      "AI_tag_3": {"max_chars": 14, "single_line": true},
+      "AI_content": {
+        "max_bullets_no_wrap": 6,
+        "max_bullets_some_wrap": 4,
+        "max_bullets_much_wrap": 3,
+        "words_per_bullet": [4, 6]
+      }
+    },
+    "bars": {
+      "AI_title": {"max_chars": 25, "single_line": true},
+      "AI_content": {
+        "max_bullets_no_wrap": 5,
+        "max_bullets_some_wrap": 4,
+        "max_bullets_much_wrap": 3,
+        "words_per_bullet": [5, 7]
+      }
+    },
+    "hexagon": {
+      "AI_title": {"max_chars": 25, "single_line": true},
+      "AI_content": {
+        "max_bullets_no_wrap": 5,
+        "max_bullets_some_wrap": 4,
+        "max_bullets_much_wrap": 3,
+        "words_per_bullet": [5, 7]
+      }
+    }
+  },
+  "slide_rules": {
+    "6": {"bars": 1, "hex": 0},
+    "7": {"bars": 2, "hex": 0},
+    "8": {"bars": 3, "hex": 0},
+    "9": {"bars": 3, "hex": 1},
+    "10": {"bars": 3, "hex": 2},
+    "11": {"bars": 3, "hex": 3},
+    "12": {"bars": 4, "hex": 3},
+    "13": {"bars": 4, "hex": 4},
+    "14": {"bars": 5, "hex": 4},
+    "15": {"bars": 5, "hex": 5},
+    "16": {"bars": 6, "hex": 5},
+    "17": {"bars": 6, "hex": 6},
+    "18": {"bars": 7, "hex": 6},
+    "19": {"bars": 8, "hex": 6},
+    "20": {"bars": 9, "hex": 6}
+  },
+  "loop_rules": {
+    "beyond_20": "alternate bars-block (3-4) with hex-block (3-4)",
+    "block_size_range": [3, 4]
+  }
+}
