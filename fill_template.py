@@ -776,15 +776,26 @@ STAGE1_PROMPT = """You are a presentation content writer. Given a topic and a sl
 Topic: {TOPIC}
 Total content slides: {content_slide_count} (this is TARGET_SLIDE_COUNT minus 2, since Start and End are not content)
 
-The content slides are divided into sections in this order:
-- First 3 slides: WHEEL type (these introduce the topic with 3 key aspects)
-- Next slides: BAR type (these explain details, each slide covers one subtopic)
-- Last slides: HEXAGON type (these cover applications, summary, or conclusions)
+The content slides are divided into sections by PRESENTATION ROLE (this is about structure, not about the subject):
+- WHEEL slides: introduce and define the main concepts (shorter boxes).
+- BAR slides: the main body -- detailed explanation, one subtopic per slide (bigger boxes).
+- HEXAGON slides: applications, examples, or summary/conclusions.
 
 For this presentation there are:
 - 3 Wheel slides
 - {bar_count} Bar slides
 - {hex_count} Hexagon slides
+
+Do NOT assume anything about the subject's content type. ANY subject may need formulas,
+equations, code, calculations, or quotes on a given slide -- business has ROI and
+break-even formulas, biology has growth equations, economics has calculations,
+programming has code, etc. -- and any subject may also be purely descriptive on a given
+slide. That decision is made per point in the next stage, from the actual content, not
+from the subject. Here, just plan the topics.
+
+For each section, set "needs_long_content": true ONLY if that slide's point genuinely
+needs a large block (a multi-line code block, a multi-line formula derivation, a long
+paragraph, or a long quote). Otherwise set it false. This is optional and rare.
 
 Return ONLY a JSON object, no markdown, no explanation:
 {
@@ -792,9 +803,9 @@ Return ONLY a JSON object, no markdown, no explanation:
   "subtitle": "subtitle, max 30 chars",
   "wheel_tags": ["tag1", "tag2", "tag3"],
   "sections": [
-    {"type": "wheel", "variant": 1, "heading": "max 14 chars", "topic": "what this slide covers"},
-    {"type": "bar", "variant": 1, "heading": "max 25 chars", "topic": "what this slide covers"},
-    {"type": "hexagon", "variant": 1, "heading": "max 25 chars", "topic": "what this slide covers"}
+    {"type": "wheel", "variant": 1, "heading": "max 14 chars", "topic": "what this slide covers", "needs_long_content": false},
+    {"type": "bar", "variant": 1, "heading": "max 25 chars", "topic": "what this slide covers", "needs_long_content": false},
+    {"type": "hexagon", "variant": 1, "heading": "max 25 chars", "topic": "what this slide covers", "needs_long_content": false}
   ]
 }
 
@@ -806,22 +817,37 @@ Rules:
 - sections must have exactly {content_slide_count} entries
 - Keep all headings short enough to never wrap to a second line"""
 
-STAGE2_PROMPT = """Write bullet points for a presentation slide.
+STAGE2_PROMPT = """Write the on-slide content for ONE presentation slide.
 
-Topic: {section.topic}
+Topic of this slide: {section.topic}
 Heading: {section.heading}
-Slide type: {section.type}
+Slide role: {role_note}
 
-Generate EXACTLY {n} bullet points.
-Each bullet MUST be short enough to fit on ONE line: {max_words} words or fewer.
-Prefer punchy, concrete phrases over full sentences.
+For each point, choose the clearest way to present it. Use bullets for descriptive
+information. If a specific point is best explained with a formula, equation, code
+snippet, calculation, or short example, include that directly instead of just describing
+it. This applies to ANY subject -- business, biology, economics, programming, chemistry,
+etc. Do not assume a subject has or lacks technical content; decide from the actual point
+being made.
 
-Return ONLY a JSON object, no markdown:
+The box is the ONLY hard constraint:
+- Each line must fit on ONE line in the box: at most about {max_chars} characters.
+- The box holds about {capacity} lines. FILL {target_min}-{target_max} of them
+  (70-85% of the box). Do not leave the box nearly empty, and do not overflow it.
+- A formula, code line, or calculation counts toward the line budget exactly like a
+  bullet does (one line each, unless it is short enough to share).
+- Never drop a major point. If space is tight, SHORTEN the wording of a point rather
+  than removing the point.
+
+Style:
+- Descriptive lines: clean concrete phrases, start with a capital, no trailing period.
+- Formulas / equations / code / calculations: write them in their natural form --
+  symbols, operators, and numbers are expected (e.g. "ROI = (Gain - Cost) / Cost * 100").
+
+Return ONLY a JSON object, no markdown, no explanation:
 {
-  "bullets": ["bullet 1", "bullet 2"]
-}
-
-Every bullet must start with a capital letter. No period at the end. No bullet may exceed {max_words} words."""
+  "lines": ["line 1", "line 2", "line 3"]
+}"""
 
 
 def _read_env_value(key, env_path):
@@ -957,16 +983,23 @@ def gemini_json(model, prompt, retries=1):
     raise ValueError(f"invalid JSON after retry: {last}")
 
 
-def stage2_bullets(model, section, n, max_words):
-    """Ask Gemini for EXACTLY `n` one-line (<= max_words) bullets for `section`."""
+def stage2_bullets(model, section, max_chars, capacity, target_min, target_max, rn):
+    """Ask Gemini for the slide's content lines. Each returned line is whatever
+    best communicates that point -- a bullet, a formula, a code line, or a short
+    calculation -- constrained only by the box (max_chars per line, ~capacity
+    lines, fill target_min..target_max). Returns a list of raw line strings."""
     prompt = (STAGE2_PROMPT
               .replace("{section.topic}", str(section.get("topic", "")))
               .replace("{section.heading}", str(section.get("heading", "")))
-              .replace("{section.type}", str(section.get("type", "")))
-              .replace("{max_words}", str(max_words))
-              .replace("{n}", str(n)))
+              .replace("{role_note}", str(rn))
+              .replace("{max_chars}", str(max_chars))
+              .replace("{capacity}", str(capacity))
+              .replace("{target_min}", str(target_min))
+              .replace("{target_max}", str(target_max)))
     data = gemini_json(model, prompt)
-    return data.get("bullets", []) if isinstance(data, dict) else []
+    if not isinstance(data, dict):
+        return []
+    return data.get("lines") or data.get("bullets") or []
 
 
 def truncate(text, n, ellipsis=False):
@@ -981,67 +1014,114 @@ def truncate(text, n, ellipsis=False):
 
 
 # ---------------------------------------------------------------------------
-# Adaptive bullet count (Pillow-measured wrapping), driven by a placeholder's
-# AI_content spec: {max_bullets_no_wrap, max_bullets_some_wrap,
-# max_bullets_much_wrap, words_per_bullet: [min, max]}
+# Adaptive content generation, driven ONLY by box size (Pillow-measured).
+#
+# No subject assumptions and no per-type "bullets-only" rule: each returned line
+# is whatever best communicates its point (bullet, formula, code, calculation),
+# and the sole hard constraint is the box -- ~max_chars per line and a line
+# capacity computed from the box height. We aim to FILL 70-85% of the box.
 # ---------------------------------------------------------------------------
+CONTENT_LINE_H_IN = LINE_FACTOR * CONTENT_PT / 72.0   # one content line's height
+FILL_TARGET_LO = 0.70      # aim to fill at least this fraction of the box
+FILL_TARGET_HI = 0.85      # ... and at most this fraction
+FILL_UNDERFULL = 0.60      # below this -> regenerate asking for more detail
+
+_CHARS_SAMPLE = ("The quick brown fox jumps over the lazy dog while counting "
+                 "1234567890 items and notes")
+
+
 def count_wraps(bullets, usable_in, hang_in):
-    """How many of `bullets` are too wide to fit on ONE line in the content box
+    """How many `bullets` are too wide to fit on ONE line in the content box
     (measured with Pillow via count_display_lines, including the '- ' hang)."""
     return sum(1 for b in bullets
                if count_display_lines(bul(b), usable_in, hang_in) > 1)
 
 
-def allowed_bullet_count(ph_content_spec, wraps):
-    """Upper bound on bullets given how many currently wrap, per the
-    placeholder's AI_content spec (max_bullets_no_wrap/some_wrap/much_wrap)."""
-    if wraps == 0:
-        return ph_content_spec["max_bullets_no_wrap"]
-    if wraps <= 2:
-        return ph_content_spec["max_bullets_some_wrap"]
-    return ph_content_spec["max_bullets_much_wrap"]
+def total_display_lines(items, usable_in, hang_in):
+    """Total rendered line count for `items` (each may wrap), measured w/ Pillow."""
+    return sum(count_display_lines(bul(x), usable_in, hang_in) for x in items)
 
 
-def adaptive_bullets(model, section, usable_in, hang_in, ph_content_spec):
-    """Generate bullets whose COUNT adapts to how many wrap in this slide's box.
+def approx_chars_per_line(usable_in):
+    """Roughly how many content-font characters fit on one usable-width line.
+    Measured with Pillow against a mixed-case sample (real gate stays the
+    per-line wrap measurement; this is just guidance passed to the model)."""
+    avg = text_width_in(_CHARS_SAMPLE, "+mj-lt", CONTENT_PT) / len(_CHARS_SAMPLE)
+    return max(10, int(usable_in / avg))
 
-    Requests the max for this placeholder, measures wrapping with Pillow, and
-    regenerates with a lower target while the count exceeds what the wrap rules
-    allow. If it cannot converge within MAX_BULLET_ITERS, the last set is
-    trimmed to the cap. Returns (bullets, wraps, log_lines).
+
+def box_line_capacity(cy_emu, ins):
+    """How many content lines fit in a box of height `cy_emu` (EMU) given insets."""
+    usable_h = cy_emu / EMU - ins["t"] - ins["b"]
+    return max(1, int(usable_h / CONTENT_LINE_H_IN))
+
+
+def role_note(stype):
+    """Structural (NOT subject) role blurb passed to the Stage 2 prompt."""
+    return {
+        "wheel":   "Wheel slide -- introduce/define a core concept (shorter box).",
+        "bar":     "Bar slide -- main body; explain this subtopic in detail.",
+        "bars":    "Bar slide -- main body; explain this subtopic in detail.",
+        "hexagon": "Hexagon slide -- applications, examples, or summary.",
+    }.get((stype or "").lower(), "Content slide -- explain this point clearly.")
+
+
+def _looks_technical(line):
+    """Heuristic marker for the printout: does this line read as a formula,
+    equation, calculation, or code (rather than a descriptive phrase)? Used only
+    for reporting so a human can verify technical content appeared where needed."""
+    s = line.strip()
+    has_math = bool(re.search(r"[=×÷≈≤≥∑∏√^]", s)) or \
+        bool(re.search(r"\d\s*[-+*/×÷]\s*\d", s))
+    has_code = bool(re.search(r"[A-Za-z_]\w*\([^)]*\)", s)) or "()" in s or \
+        s.endswith(":") or bool(re.search(r"[{}<>]|::|=>|->", s))
+    return has_math or has_code
+
+
+def adaptive_bullets(model, section, usable_in, hang_in, ph_content_spec, capacity):
+    """Generate the slide's content lines, filling 70-85% of the box.
+
+    Requests content sized to the box (max_chars/line + fill target derived from
+    `capacity`), measures the rendered line total with Pillow, and regenerates
+    once or twice if the box is under-full (<60%) or overflowing (>100%). Points
+    are never dropped here -- the model is asked to shorten instead. Returns
+    (lines, total_lines, log). `ph_content_spec` is accepted for signature
+    compatibility but the box now drives everything.
     """
-    target = ph_content_spec["max_bullets_no_wrap"]
-    max_words = ph_content_spec["words_per_bullet"][-1]
+    max_chars = approx_chars_per_line(usable_in)
+    target_min = max(1, round(FILL_TARGET_LO * capacity))
+    target_max = max(target_min, int(FILL_TARGET_HI * capacity))
+    low_water = max(1, int(FILL_UNDERFULL * capacity))
+    rn = role_note(section.get("type"))
     log = []
-    last = ([], 0)
+    last = []
     for attempt in range(MAX_BULLET_ITERS):
         try:
-            raw = stage2_bullets(model, section, target, max_words)
+            raw = stage2_bullets(model, section, max_chars, capacity,
+                                 target_min, target_max, rn)
         except Exception as exc:  # noqa: BLE001 - reported, then fall back
-            log.append(f"try{attempt + 1}: gen(target={target}) FAILED: {exc}")
+            log.append(f"try{attempt + 1}: gen FAILED: {exc}")
             time.sleep(API_CALL_DELAY)
             break
         time.sleep(API_CALL_DELAY)
-        bullets = [b.strip() for b in raw
-                   if isinstance(b, str) and b.strip()][:target]
-        wraps = count_wraps(bullets, usable_in, hang_in)
-        cap = allowed_bullet_count(ph_content_spec, wraps)
-        log.append(f"try{attempt + 1}: asked {target}, got {len(bullets)}, "
-                   f"wraps={wraps} -> allowed<={cap}")
-        last = (bullets, wraps)
-        if len(bullets) <= cap:
-            return bullets, wraps, log          # meets the criteria
-        if cap >= target:                       # cannot lower further
-            break
-        target = cap                            # regenerate with fewer
+        items = [x.strip() for x in raw if isinstance(x, str) and x.strip()]
+        total = total_display_lines(items, usable_in, hang_in)
+        pct = (100.0 * total / capacity) if capacity else 0.0
+        log.append(f"try{attempt + 1}: {len(items)} items -> {total} lines "
+                   f"(cap {capacity}, {pct:.0f}% full; target {target_min}-{target_max})")
+        last = items
+        if total > capacity:                    # overflow -> ask to shorten/fewer
+            target_max = max(target_min, capacity - 1)
+            continue
+        if total < low_water:                   # under-full -> ask for more detail
+            target_min = min(capacity, target_max + 1)
+            target_max = capacity
+            continue
+        return items, total, log                # 60-100% full -> accept
 
-    bullets, wraps = last                       # did not converge -> trim
-    cap = allowed_bullet_count(ph_content_spec, wraps)
-    if len(bullets) > cap:
-        bullets = bullets[:cap]
-        wraps = count_wraps(bullets, usable_in, hang_in)
-        log.append(f"trim -> {len(bullets)} bullets, wraps={wraps}")
-    return bullets, wraps, log
+    # did not converge: keep the last set. fill_content_bullets grows the box to
+    # fit, and only drops as an absolute last resort.
+    return last, total_display_lines(last, usable_in, hang_in), log
 
 
 def _fill_shape_text(slide, name, lines):
@@ -1091,7 +1171,9 @@ def generate_content(topic, spec, sequence, model):
     print(f"  wheel_tags: {wheel_tags}")
     print(f"  sections  : {len(sections)} (need {content_slide_count})")
     for s in sections:
-        print(f"     - {s.get('type'):7} heading={s.get('heading')!r} topic={s.get('topic')!r}")
+        lc = "  [needs_long_content]" if s.get("needs_long_content") else ""
+        print(f"     - {s.get('type'):7} heading={s.get('heading')!r} "
+              f"topic={s.get('topic')!r}{lc}")
 
     # Queue per section kind, keyed to match spec["placeholders"] ("bar" -> "bars").
     queues = {"wheel": [], "bars": [], "hexagon": []}
@@ -1115,8 +1197,9 @@ def fill_placeholders(prs, content, spec, sequence, model):
     hang = marL / EMU
     queues = content["queues"]
 
-    print("\n=== STAGE 2 + FILL (adaptive bullets, measured wrapping) ===")
+    print("\n=== STAGE 2 + FILL (per-point format, box-only constraint, fill 70-85%) ===")
     summary = []
+    long_flags = []
     for i, (variant, _idx, _label) in enumerate(sequence):
         slide = prs.slides[i]
 
@@ -1135,14 +1218,18 @@ def fill_placeholders(prs, content, spec, sequence, model):
         default_sec = {"type": "bar" if key == "bars" else key,
                        "heading": "", "topic": ""}
         sec = queues[key].pop(0) if queues[key] else default_sec
+        if sec.get("needs_long_content"):
+            long_flags.append((i + 1, variant, sec.get("heading", "")))
 
         content_shape = find_shape(slide, "AI_content")
-        _, _, cx, _ = geom_emu(content_shape)
+        _, _, cx, cy = geom_emu(content_shape)
         ins = get_ins(content_shape)
         usable = cx / EMU - ins["l"] - ins["r"]
+        capacity = box_line_capacity(cy, ins)
 
-        # adaptive bullet generation (Pillow-measured, regenerate if over-wrapped)
-        bullets, _wraps, log = adaptive_bullets(model, sec, usable, hang, ph["AI_content"])
+        # box-driven content generation (per-point format, fill 70-85% of the box)
+        bullets, _tot, log = adaptive_bullets(
+            model, sec, usable, hang, ph["AI_content"], capacity)
 
         # headings / wheel tags
         if variant == "Wheel":
@@ -1166,24 +1253,40 @@ def fill_placeholders(prs, content, spec, sequence, model):
             head_line = (f"heading={heading!r} ({len(heading)} chars, "
                          f"<= {max_heading}){wnote}")
 
-        # fill content; height-fit may drop bullets -> recount on the FINAL set
+        # fill content; height-fit may drop lines -> recount on the FINAL set
         final_bullets, fit_note, _anim = fill_content_bullets(
             slide, bullets, slide_h_in, MIN_TOP_IN, marL)
+        final_lines = total_display_lines(final_bullets, usable, hang)
         final_wraps = count_wraps(final_bullets, usable, hang)
+        n_tech = sum(1 for b in final_bullets if _looks_technical(b))
+        fill_pct = (100.0 * final_lines / capacity) if capacity else 0.0
 
-        print(f"\nSlide {i + 1:2} {variant}")
+        print(f"\nSlide {i + 1:2} {variant}"
+              f"{'  [needs_long_content]' if sec.get('needs_long_content') else ''}")
         print(f"    {head_line}")
         for step in log:
             print(f"    - {step}")
-        print(f"    -> FINAL bullets={len(final_bullets)}  wraps={final_wraps}  "
-              f"[{fit_note}]  (box usable={usable:.2f}in)")
+        print(f"    -> FINAL items={len(final_bullets)} lines={final_lines} "
+              f"({fill_pct:.0f}% of {capacity}-line box)  wraps={final_wraps}  "
+              f"tech-lines={n_tech}  [{fit_note}]  (usable={usable:.2f}in)")
         for b in final_bullets:
-            print(f"        - {b}")
-        summary.append((i + 1, variant, len(final_bullets), final_wraps))
+            mark = "  <-- formula/code" if _looks_technical(b) else ""
+            print(f"        - {b}{mark}")
+        summary.append((i + 1, variant, len(final_bullets), final_lines,
+                        capacity, n_tech))
 
-    print("\n=== SUMMARY: final bullet & wrap counts ===")
-    for sidx, variant, nb, nw in summary:
-        print(f"   Slide {sidx:2} {variant:8}: bullets={nb}  wraps={nw}")
+    print("\n=== SUMMARY: fill % and technical-line counts ===")
+    for sidx, variant, nb, nlines, cap, ntech in summary:
+        pct = (100.0 * nlines / cap) if cap else 0.0
+        print(f"   Slide {sidx:2} {variant:8}: items={nb} lines={nlines}/{cap} "
+              f"({pct:.0f}% full)  formula/code lines={ntech}")
+
+    if long_flags:
+        print("\n=== needs_long_content flagged (NOT routed) ===")
+        print("   The neon template has no long-content layout (slides 21-22 do "
+              "not exist), so these were filled in the normal box instead:")
+        for sidx, variant, heading in long_flags:
+            print(f"   Slide {sidx:2} {variant:8}: {heading!r}")
     return summary
 
 

@@ -6,3 +6,4 @@ output_*.pptx
 *.pptx
 !templates/neon/template.pptx
 generated/
+test_runs.log
