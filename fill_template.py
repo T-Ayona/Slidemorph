@@ -103,16 +103,23 @@ def font_path(typeface):
 _FONT_CACHE = {}
 
 
-def _font(path, pt):
-    key = (path, int(round(pt)))
+def _font(typeface, pt):
+    """Load and cache a font by typeface + size. Falls back to Pillow's default
+    font when the requested TTF is missing (e.g. non-Windows deploy targets)."""
+    key = f"{typeface}-{pt}"
     if key not in _FONT_CACHE:
-        _FONT_CACHE[key] = ImageFont.truetype(path, int(round(pt)))
+        try:
+            path = font_path(typeface)
+            _FONT_CACHE[key] = ImageFont.truetype(path, int(round(pt)))
+        except (OSError, IOError):
+            print(f"Warning: Font {typeface!r} not found. Using default font.")
+            _FONT_CACHE[key] = ImageFont.load_default()
     return _FONT_CACHE[key]
 
 
 def text_width_in(text, typeface, pt):
     """Rendered width of `text` in inches (font size in pt-as-px -> px==pt)."""
-    return _font(font_path(typeface), pt).getlength(text) / 72.0
+    return _font(typeface, pt).getlength(text) / 72.0
 
 
 def bul(text):
