@@ -905,11 +905,13 @@ class _FallbackModel:
 
 
 def load_gemini(folder):
-    """Configure Gemini from GEMINI_API_KEY in .env; return a model handle."""
+    """Configure Gemini from GEMINI_API_KEY (env var first, then .env);
+    return a model handle."""
     import google.generativeai as genai  # lazy: keeps the deprecation warning out of other runs
-    key = _read_env_value("GEMINI_API_KEY", os.path.join(folder, ".env"))
+    key = os.getenv("GEMINI_API_KEY") or _read_env_value(
+        "GEMINI_API_KEY", os.path.join(folder, ".env"))
     if not key:
-        raise RuntimeError("GEMINI_API_KEY not found in .env")
+        raise RuntimeError("GEMINI_API_KEY not found in env or .env")
     genai.configure(api_key=key)
     print(f"Gemini ready (models={GEMINI_MODELS}, key loaded: {len(key)} chars)")
     return _FallbackModel(genai, GEMINI_MODELS)

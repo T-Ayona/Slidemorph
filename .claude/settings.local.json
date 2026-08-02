@@ -38,7 +38,13 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('fill_template.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
       "Bash(grep -vE \"^\\\\* Quota|^Please retry|^  description:|^  url:|^, violations|^  quota_|^, retry_delay|^  seconds:|^\\\\]|^, links|^\\\\{|^\\\\}|^  key:|^  value:|generativelanguage.googleapis\")",
       "Bash(./venv/Scripts/python.exe fill_template.py --template neon --topic \"Machine Learning\" --count 13 --output output_v5.pptx)",
-      "Bash(git init *)"
+      "Bash(git init *)",
+      "Bash(./venv/Scripts/pip.exe freeze *)",
+      "Bash(./venv/Scripts/python.exe -m pip install python-dotenv)",
+      "Bash(./venv/Scripts/python.exe -c \"import dotenv; print\\('ok', dotenv.__version__\\)\")",
+      "Bash(./venv/Scripts/python.exe app.py)",
+      "Read(//c/Users/ABDULL~1/AppData/Local/Temp/claude/C--slidemorph/f09bf47c-de0d-46a1-acc7-d7fa06a365e1/tasks/**)",
+      "Bash(curl -sI http://127.0.0.1:7860/)"
     ]
   }
 }

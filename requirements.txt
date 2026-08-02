@@ -1,0 +1,6 @@
+gradio>=4.0
+python-pptx>=1.0
+Pillow>=10.0
+lxml>=5.0
+google-generativeai>=0.8
+python-dotenv>=1.0
