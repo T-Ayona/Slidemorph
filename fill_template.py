@@ -86,18 +86,25 @@ QUOTA_RETRY_CAP = 45.0                      # max seconds to wait on a rate-limi
 MAX_QUOTA_WAITS = 2                         # wait+retry attempts on the last model
 API_CALL_DELAY = 2.0                        # seconds between calls (rate limiting)
 
-FONTS_DIR = r"C:\Windows\Fonts"
+# Bundled fonts live next to this file in ./fonts/, so measurements are
+# identical on Windows, macOS, and Linux (no dependency on system fonts).
+# Both are OFL-licensed (see fonts/OFL.txt):
+#   Carlito -- metric-compatible replacement for Calibri (by Google).
+#   Anton   -- condensed heavy display face used in place of Impact.
+FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+_DEFAULT_FONT = "Carlito-Regular.ttf"
 FONT_FILE = {
-    "Impact": "impact.ttf",
-    "Calibri Light": "calibril.ttf",
-    "Calibri": "calibri.ttf",
-    "+mj-lt": "calibril.ttf",     # theme major font = Calibri Light
-    "+mn-lt": "calibri.ttf",
+    "Impact": "Anton-Regular.ttf",
+    "Calibri Light": "Carlito-Regular.ttf",
+    "Calibri": "Carlito-Regular.ttf",
+    "+mj-lt": "Carlito-Regular.ttf",     # theme major font = Calibri Light
+    "+mn-lt": "Carlito-Regular.ttf",     # theme minor font = Calibri
+    "Arial Narrow": "Carlito-Regular.ttf",
 }
 
 
 def font_path(typeface):
-    return os.path.join(FONTS_DIR, FONT_FILE.get(typeface, "arial.ttf"))
+    return os.path.join(FONTS_DIR, FONT_FILE.get(typeface, _DEFAULT_FONT))
 
 
 _FONT_CACHE = {}
