@@ -93,35 +93,79 @@ API_CALL_DELAY = 2.0                        # seconds between calls (rate limiti
 #   Anton   -- condensed heavy display face used in place of Impact.
 FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 _DEFAULT_FONT = "Carlito-Regular.ttf"
+
+# Explicit typeface -> bundled file mappings. Anything not listed here (theme
+# placeholders like "+mj-lt", other Windows font names, unknown typefaces) still
+# resolves via font_path() below to _DEFAULT_FONT -- Pillow is NEVER handed a
+# raw typeface name; it always receives a real absolute path to a bundled TTF.
 FONT_FILE = {
     "Impact": "Anton-Regular.ttf",
     "Calibri Light": "Carlito-Regular.ttf",
     "Calibri": "Carlito-Regular.ttf",
-    "+mj-lt": "Carlito-Regular.ttf",     # theme major font = Calibri Light
-    "+mn-lt": "Carlito-Regular.ttf",     # theme minor font = Calibri
     "Arial Narrow": "Carlito-Regular.ttf",
 }
 
 
 def font_path(typeface):
+    """Absolute path to the bundled TTF for `typeface`. Guarantees a real file
+    for every possible input:
+      - PowerPoint theme placeholders ('+mj-lt', '+mn-lt', '+mj-ea', ...) -> Carlito
+      - Windows/Mac font names not in FONT_FILE -> Carlito
+      - None / empty -> Carlito
+    Nothing else in the code should build a font path -- go through this."""
+    if not typeface or typeface.startswith("+"):
+        return os.path.join(FONTS_DIR, _DEFAULT_FONT)
     return os.path.join(FONTS_DIR, FONT_FILE.get(typeface, _DEFAULT_FONT))
 
 
 _FONT_CACHE = {}
+_DEFAULT_FONT_WARNED = False
 
 
 def _font(typeface, pt):
-    """Load and cache a font by typeface + size. Falls back to Pillow's default
-    font when the requested TTF is missing (e.g. non-Windows deploy targets)."""
-    key = f"{typeface}-{pt}"
-    if key not in _FONT_CACHE:
-        try:
-            path = font_path(typeface)
-            _FONT_CACHE[key] = ImageFont.truetype(path, int(round(pt)))
-        except (OSError, IOError):
-            print(f"Warning: Font {typeface!r} not found. Using default font.")
-            _FONT_CACHE[key] = ImageFont.load_default()
+    """Load and cache a font by typeface + size. Never raises: on any error it
+    prints the exact path that failed and falls back to Pillow's built-in
+    default (so width measurements degrade gracefully instead of crashing)."""
+    global _DEFAULT_FONT_WARNED
+    key = f"{typeface}-{int(round(pt))}"
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+    path = font_path(typeface)
+    try:
+        _FONT_CACHE[key] = ImageFont.truetype(path, int(round(pt)))
+    except Exception as exc:  # noqa: BLE001 - want a total safety net
+        if not _DEFAULT_FONT_WARNED:
+            print(f"[font] WARNING: could not load {typeface!r} from "
+                  f"{path!r} ({type(exc).__name__}: {exc}); "
+                  f"falling back to Pillow's built-in default font")
+            _DEFAULT_FONT_WARNED = True
+        _FONT_CACHE[key] = ImageFont.load_default()
     return _FONT_CACHE[key]
+
+
+def _startup_font_check():
+    """One-shot diagnostic. Prints the fonts folder, its contents, and whether
+    each bundled TTF is loadable. Runs at import so Streamlit Cloud logs it
+    immediately on app boot -- no need to trigger a generation to see it."""
+    print(f"[font] FONTS_DIR = {FONTS_DIR}")
+    print(f"[font] FONTS_DIR exists = {os.path.isdir(FONTS_DIR)}")
+    if os.path.isdir(FONTS_DIR):
+        entries = sorted(os.listdir(FONTS_DIR))
+        print(f"[font] FONTS_DIR contents ({len(entries)} item(s)): {entries}")
+    for tf, fn in list(FONT_FILE.items()) + [("<default>", _DEFAULT_FONT)]:
+        p = os.path.join(FONTS_DIR, fn)
+        ok = os.path.isfile(p)
+        loaded = False
+        if ok:
+            try:
+                ImageFont.truetype(p, 12)
+                loaded = True
+            except Exception as exc:  # noqa: BLE001
+                loaded = f"LOAD FAIL ({type(exc).__name__}: {exc})"
+        print(f"[font]   {tf:15} -> {p}  exists={ok}  loaded={loaded}")
+
+
+_startup_font_check()
 
 
 def text_width_in(text, typeface, pt):
