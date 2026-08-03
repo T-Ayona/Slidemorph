@@ -10,7 +10,8 @@
     "wheel": {"slides": [2, 3, 4], "count": 3},
     "bars": {"slides": [5, 6, 7, 8, 9, 10, 11, 12, 13], "count": 9},
     "hexagon": {"slides": [14, 15, 16, 17, 18, 19], "count": 6},
-    "end": {"slide": 20}
+    "end": {"slide": 20},
+    "long_content": {"slides": [21, 22], "count": 2}
   },
   "placeholders": {
     "start": {
@@ -18,9 +19,9 @@
       "AI_subtitle": {"max_chars": 30, "single_line": true}
     },
     "wheel": {
-      "AI_tag_1": {"max_chars": 14, "single_line": true},
-      "AI_tag_2": {"max_chars": 14, "single_line": true},
-      "AI_tag_3": {"max_chars": 14, "single_line": true},
+      "AI_tag_1": {"max_chars": 36, "max_chars_per_line": 18, "max_lines": 2},
+      "AI_tag_2": {"max_chars": 36, "max_chars_per_line": 18, "max_lines": 2},
+      "AI_tag_3": {"max_chars": 36, "max_chars_per_line": 18, "max_lines": 2},
       "AI_content": {
         "max_bullets_no_wrap": 6,
         "max_bullets_some_wrap": 4,
@@ -45,6 +46,16 @@
         "max_bullets_much_wrap": 3,
         "words_per_bullet": [5, 7]
       }
+    },
+    "long_content": {
+      "AI_title": {"max_chars": 25, "single_line": true},
+      "AI_content": {
+        "plain_text": true,
+        "preserve_line_breaks": true,
+        "no_bullets": true,
+        "max_lines": 20,
+        "max_chars_per_line": 90
+      }
     }
   },
   "slide_rules": {
@@ -67,5 +78,15 @@
   "loop_rules": {
     "beyond_20": "alternate bars-block (3-4) with hex-block (3-4)",
     "block_size_range": [3, 4]
+  },
+  "long_content_rules": {
+    "max_per_deck": 3,
+    "route_from": ["bars", "hexagon"],
+    "by_deck_size": [
+      {"from": 6,  "to": 20, "min_long": 0, "max_long": 2},
+      {"from": 21, "to": 30, "min_long": 1, "max_long": 3}
+    ],
+    "min_fill_fraction": 0.60,
+    "demote_if_underfull": true
   }
 }

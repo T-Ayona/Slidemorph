@@ -42,9 +42,20 @@ Text-fit mechanics (unchanged from earlier versions):
 import argparse
 import os
 import re
+import sys
 import copy
 import json
 import time
+
+# Generated content routinely contains characters the Windows console codepage
+# (cp1252) cannot encode -- Greek letters in complexity notation, en-dashes, box
+# glyphs. Without this, a single such character raises UnicodeEncodeError out of
+# print() and aborts the run. Degrade those characters instead of the deck.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - older/odd streams: leave them alone
+        pass
 
 from lxml import etree
 from pptx import Presentation
@@ -175,6 +186,65 @@ def text_width_in(text, typeface, pt):
 
 def bul(text):
     return BULLET + text
+
+
+# Leading list markers Gemini sometimes prepends even when asked not to. The
+# template already draws the bullet dot via bul(), so a marker in the text itself
+# produces a visible double bullet ("* - foo" / "* * foo"). These strippers remove
+# it. A marker only counts when followed by whitespace, so "-5", "->", and ">>>"
+# (arrows / REPL prompts / negative numbers) are preserved.
+_BULLET_MARK = "•‣◦⁃∙–—*\\-"   # • ‣ ◦ ⁃ ∙ – — * -
+_BULLET_INLINE_RE = re.compile(r"^\s*[" + _BULLET_MARK + r"][ \t]+")
+_BULLET_INDENT_RE = re.compile(r"^(\s*)[" + _BULLET_MARK + r">][ \t]+(.*)$")
+
+
+def strip_bullet_prefix(text):
+    """Remove leading list markers from a bullet string (repeatedly, to catch
+    "* - foo"). Leading indentation is not meaningful for bullets, so it is
+    dropped. Use this for AI_content bullets before bul() re-adds the single dot."""
+    s = (text or "").strip()
+    for _ in range(3):
+        new = _BULLET_INLINE_RE.sub("", s, count=1)
+        if new == s:
+            break
+        s = new.strip()
+    return s
+
+
+def strip_long_bullet(line):
+    """Remove a single leading list marker from a long-content line WHILE
+    preserving code indentation on lines that have no marker. A bulleted line
+    ("    - foo") loses both marker and its indent (it was never real code
+    indentation); a plain code line ("    return x") is returned untouched."""
+    m = _BULLET_INDENT_RE.match(line or "")
+    return m.group(2) if m else (line or "")
+
+
+def wrap_to_lines(text, max_chars_per_line, max_lines):
+    """Greedy word-wrap `text` into at most `max_lines` lines of <= max_chars_per_line
+    each, without splitting words. If it will not fit, the last line is
+    ellipsized so a word is never chopped mid-way. Returns a list of 1..max_lines
+    lines (always at least one)."""
+    words = (text or "").split()
+    if not words:
+        return [""]
+    lines, cur = [], ""
+    for w in words:
+        trial = w if not cur else cur + " " + w
+        if len(trial) <= max_chars_per_line or not cur:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = w
+            if len(lines) == max_lines:         # no room for more lines
+                break
+    if len(lines) < max_lines:
+        lines.append(cur)
+    else:                                        # ran out of lines: fold the rest in
+        rest = text[len(" ".join(lines)):].strip()
+        tail = (lines[-1] + " " + rest).strip() if rest else lines[-1]
+        lines[-1] = truncate(tail, max_chars_per_line, ellipsis=True)
+    return lines[:max_lines]
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +480,10 @@ def fill_content_bullets(slide, bullets, slide_h_in, top_limit_in, marL_emu):
     animated = animated_para_indices(slide, spid)
     txBody = shape.text_frame._txBody
 
-    bullets = list(bullets)
+    # Final safety net for double bullets: the template's bul() adds the one dot,
+    # so any marker still on the text here would render as "* - ...".
+    bullets = [strip_bullet_prefix(b) for b in bullets]
+    bullets = [b for b in bullets if b]
     staggered = len(animated) > 1
     if staggered:                   # one bullet per animated paragraph
         bullets = bullets[:len(animated)]
@@ -851,9 +924,20 @@ programming has code, etc. -- and any subject may also be purely descriptive on 
 slide. That decision is made per point in the next stage, from the actual content, not
 from the subject. Here, just plan the topics.
 
-For each section, set "needs_long_content": true ONLY if that slide's point genuinely
-needs a large block (a multi-line code block, a multi-line formula derivation, a long
-paragraph, or a long quote). Otherwise set it false. This is optional and rare.
+For sections with detailed content -- full code examples, step-by-step calculations,
+algorithms, detailed explanations, or important quotes -- mark them as
+"needs_long_content": true to get a large dedicated slide. Fill these slides with
+substantial content (8-18 lines for code, 6-10 sentences for paragraphs) -- these are big
+slides that need real content, not short summaries. For decks over 20 slides, always
+include at least one long-content section. For shorter decks, use when the topic
+genuinely has detailed content worth showing. Never mark wheel/intro sections as
+long-content.
+
+{long_content_guidance}
+
+A long-content section replaces one Bar or Hexagon slot -- it does not add a slide, and
+it never replaces a Wheel slide. If a point is short enough to work as a few bullets,
+leave needs_long_content false and let it be a normal Bar/Hexagon slide.
 
 Return ONLY a JSON object, no markdown, no explanation:
 {
@@ -871,7 +955,9 @@ Rules:
 - title max 20 characters
 - subtitle max 30 characters
 - bar and hexagon headings max 25 characters (must fit on ONE line)
-- wheel_tags are the 3 labels on the wheel, max 18 chars each
+- wheel_tags are the 3 labels on the wheel; each may wrap to 2 lines, so up to
+  about 36 characters total (max 18 per line). Prefer short labels, but full words
+  are fine -- they will wrap rather than being cut off
 - sections must have exactly {content_slide_count} entries
 - Keep all headings short enough to never wrap to a second line"""
 
@@ -905,6 +991,41 @@ Style:
 Return ONLY a JSON object, no markdown, no explanation:
 {
   "lines": ["line 1", "line 2", "line 3"]
+}"""
+
+STAGE2_LONG_PROMPT = """Write the FULL-DETAIL content for ONE large presentation slide.
+
+Topic of this slide: {section.topic}
+Heading: {section.heading}
+
+This slide has a MASSIVE box (10.9 inches wide, 5 inches tall). It exists because the
+point needs a big block that does NOT work as short bullets -- a full code example (a
+whole loop/function/program), a step-by-step calculation with the working shown, a
+complete algorithm or pseudocode, a detailed explanatory paragraph, or an important quote
+plus its context. Produce exactly that: the real thing, as it should literally appear on
+the slide.
+
+How much content (this is the important part -- do NOT under-fill):
+- Code blocks: 8-18 lines of actual code with proper indentation.
+- Paragraphs: 6-10 sentences of detailed explanation, in full flowing prose.
+- Calculations: every step on its own line, the full working shown start to finish.
+- Algorithms: the complete pseudocode or numbered steps written out.
+- Quotes: the full quote, then a few sentences of context explanation.
+
+Hard constraints:
+- Write AT LEAST {min_lines} lines and at most about {max_lines} lines; each line at most
+  about {max_chars} characters.
+- Three short lines in a huge box is a FAILURE. Use the space.
+- Preserve meaningful line breaks AND indentation. For code, put each statement on its
+  own line and keep indentation using real spaces (e.g. 4 spaces per level).
+- Do NOT use bullet points, and do NOT prefix lines with "-", "*", or "|". Write it
+  exactly as it should read.
+- For paragraphs, write full sentences that flow; do not compress into fragments.
+
+Return ONLY a JSON object, no markdown, no code fences. Put the whole block in one
+string with "\\n" between lines (indentation as literal spaces):
+{
+  "content": "line one\\nline two\\n    indented line three"
 }"""
 
 
@@ -1060,6 +1181,26 @@ def stage2_bullets(model, section, max_chars, capacity, target_min, target_max, 
     return data.get("lines") or data.get("bullets") or []
 
 
+def stage2_long_content(model, section, max_lines, max_chars, min_lines=1):
+    """Ask Gemini for the full multi-line block for a long-content slide (code,
+    derivation, algorithm, or paragraph). Returns the block as a single string
+    with '\\n' line breaks and literal-space indentation preserved."""
+    prompt = (STAGE2_LONG_PROMPT
+              .replace("{section.topic}", str(section.get("topic", "")))
+              .replace("{section.heading}", str(section.get("heading", "")))
+              .replace("{min_lines}", str(min_lines))
+              .replace("{max_lines}", str(max_lines))
+              .replace("{max_chars}", str(max_chars)))
+    data = gemini_json(model, prompt)
+    if isinstance(data, dict):
+        body = data.get("content")
+        if isinstance(body, list):                 # tolerate a list of lines
+            body = "\n".join(str(x) for x in body)
+        if isinstance(body, str) and body.strip():
+            return body
+    return ""
+
+
 def truncate(text, n, ellipsis=False):
     """Clip `text` to `n` chars. With ellipsis=True an over-limit string is cut to
     n-3 chars and gets a trailing '...' so the RESULT is still <= n chars."""
@@ -1162,7 +1303,8 @@ def adaptive_bullets(model, section, usable_in, hang_in, ph_content_spec, capaci
             time.sleep(API_CALL_DELAY)
             break
         time.sleep(API_CALL_DELAY)
-        items = [x.strip() for x in raw if isinstance(x, str) and x.strip()]
+        items = [strip_bullet_prefix(x) for x in raw if isinstance(x, str)]
+        items = [x for x in items if x]         # drop marker-only / empty lines
         total = total_display_lines(items, usable_in, hang_in)
         pct = (100.0 * total / capacity) if capacity else 0.0
         log.append(f"try{attempt + 1}: {len(items)} items -> {total} lines "
@@ -1189,6 +1331,337 @@ def _fill_shape_text(slide, name, lines):
 
 
 # ---------------------------------------------------------------------------
+# Long-content routing (optional slides 21/22): pair each content slot with its
+# outline section, then reroute sections the AI flagged needs_long_content onto
+# the template's long-content slides. Structure-driven -- if a template's spec
+# has no "long_content" section, routing is simply skipped.
+# ---------------------------------------------------------------------------
+_KIND_TO_PH = {"Wheel": "wheel", "Bars": "bars", "Hexagon": "hexagon"}
+
+
+def long_content_limits(count, spec):
+    """(min_long, max_long) for a `count`-slide deck, from long_content_rules
+    ('by_deck_size' bands, clamped by 'max_per_deck'). Small decks may legitimately
+    use zero; long decks (21-30) require at least one. Returns (0, 0) for a
+    template with no long-content slides."""
+    lc = spec["sections"].get("long_content")
+    rules = spec.get("long_content_rules", {})
+    if not lc or not lc.get("slides"):
+        return 0, 0
+    cap = rules.get("max_per_deck", 0)
+    lo, hi = 0, cap
+    for band in rules.get("by_deck_size", []):
+        if band.get("from", 0) <= count <= band.get("to", 10 ** 6):
+            lo = band.get("min_long", 0)
+            hi = band.get("max_long", cap)
+            break
+    hi = min(hi, cap)
+    return min(lo, hi), hi
+
+
+def route_plan(sequence, sections, spec):
+    """Turn (sequence, outline sections) into an ordered list of slot dicts, one
+    per slide: {kind, tmpl_idx, label, section, is_long}. Sections flagged
+    needs_long_content (Bars/Hexagon only -- never Wheel) are rerouted onto the
+    spec's long-content template slides, alternating between them, within the
+    deck-size limits from long_content_limits(). If the outline flagged fewer than
+    the required minimum (decks of 21+), extra Bars/Hexagon slots are promoted to
+    make up the difference. A rerouted slot REPLACES its bar/hex slot, so the deck
+    length never changes. Returns the slot list (len == len(sequence))."""
+    lc = spec["sections"].get("long_content")
+    rules = spec.get("long_content_rules", {})
+    long_slides = lc["slides"] if lc else []
+    min_long, max_long = long_content_limits(len(sequence), spec)
+    route_from = set(rules.get("route_from", ["bars", "hexagon"]))
+
+    # Assign sections to content slots by type, mirroring the outline's grouping.
+    queues = {"wheel": [], "bars": [], "hexagon": []}
+    for sec in sections:
+        st = (sec.get("type") or "").lower()
+        queues.setdefault("bars" if st == "bar" else st, []).append(sec)
+
+    slots = []
+    for kind, tmpl_idx, label in sequence:
+        if kind in ("Start", "End"):
+            slots.append({"kind": kind, "tmpl_idx": tmpl_idx, "label": label,
+                          "section": None, "is_long": False})
+            continue
+        qk = _KIND_TO_PH[kind]
+        sec = queues[qk].pop(0) if queues[qk] else {"type": qk, "heading": "",
+                                                    "topic": ""}
+        slots.append({"kind": kind, "tmpl_idx": tmpl_idx, "label": label,
+                      "section": sec, "is_long": False})
+
+    def eligible(slot):
+        """Bars/Hexagon only -- Wheel slides are always kept for intro/definitions."""
+        return (not slot["is_long"]
+                and _KIND_TO_PH.get(slot["kind"]) in route_from)
+
+    def promote(slot, n):
+        slot["orig_kind"] = slot["kind"]
+        slot["pre_long_tmpl_idx"] = slot["tmpl_idx"]    # so it can be demoted back
+        slot["kind"] = "LongContent"
+        slot["tmpl_idx"] = long_slides[n % len(long_slides)]
+        slot["is_long"] = True
+
+    # Reroute the flagged Bars/Hexagon slots, up to the deck-size maximum.
+    used = 0
+    for slot in slots:
+        if used >= max_long:
+            break
+        sec = slot["section"]
+        if sec and sec.get("needs_long_content") and eligible(slot):
+            promote(slot, used)
+            used += 1
+
+    # Long decks must have at least min_long. If the outline under-flagged, promote
+    # additional Bars/Hexagon slots, preferring the most detail-heavy role (Bars)
+    # and skipping the very first content slide.
+    if used < min_long:
+        pool = [s for s in slots[1:] if eligible(s)]
+        pool.sort(key=lambda s: 0 if s["kind"] == "Bars" else 1)
+        for slot in pool:
+            if used >= min_long:
+                break
+            slot["forced_long"] = True
+            promote(slot, used)
+            used += 1
+
+    return slots
+
+
+def build_deck_from_slots(slots, src_path, out_path):
+    """Clone the template slides named by each slot's `tmpl_idx` (in order) into
+    a fresh deck, drop the originals, and save. Returns the final slide count."""
+    prs = open_template(src_path)
+    n_orig = len(prs.slides._sldIdLst)
+    for slot in slots:
+        clone_slide(prs, prs.slides[slot["tmpl_idx"] - 1])
+    delete_slides(prs, list(range(n_orig)), verbose=False)
+    prs.save(out_path)
+    return len(prs.slides._sldIdLst)
+
+
+MAX_LONG_ITERS = 3          # generation attempts before accepting an under-full block
+LONG_MAX_LINES = 20         # hard cap: never insert more than this many lines
+LONG_SAFE_FRAC = 0.85       # fill target ceiling: only use this much of the box height
+LONG_GAP_IN = 0.15          # min vertical gap between title bottom and content top
+
+
+def long_box_spec(spec, shape):
+    """Line budget for a long-content AI_content box: (usable_in, capacity,
+    max_lines, max_chars, min_lines). `capacity` leaves a safety margin -- only
+    LONG_SAFE_FRAC of the box height is used -- and is hard-capped at
+    LONG_MAX_LINES, so a filled block can never overflow the box. min_lines is the
+    60%-fill floor the model is told to clear."""
+    lc_ph = spec["placeholders"]["long_content"]["AI_content"]
+    _, _, cx, cy = geom_emu(shape)
+    ins = get_ins(shape)
+    _tf, pt = run_font(shape, "+mj-lt", CONTENT_PT)
+    usable = cx / EMU - ins["l"] - ins["r"]
+    usable_h = cy / EMU - ins["t"] - ins["b"]
+    line_h = LINE_FACTOR * pt / 72.0
+    by_height = int(LONG_SAFE_FRAC * usable_h / line_h)          # 85% of the box
+    capacity = max(1, min(by_height, LONG_MAX_LINES))            # ... and <= 20
+    max_lines = min(lc_ph.get("max_lines", capacity), capacity)
+    # The spec's max_chars_per_line is an upper bound, not the truth: what actually
+    # fits is measured from the real box width and font. Taking the larger of the
+    # two lets prose lines wrap to 2 display lines each, which silently halves the
+    # usable line budget and gets the tail of the block trimmed off.
+    measured_chars = approx_chars_per_line(usable)
+    max_chars = min(lc_ph.get("max_chars_per_line", measured_chars), measured_chars)
+    frac = spec.get("long_content_rules", {}).get("min_fill_fraction", 0.60)
+    min_lines = max(1, int(round(frac * capacity)))
+    return usable, capacity, max_lines, max_chars, min_lines
+
+
+def measure_long_body(body, usable_in, capacity):
+    """Split a generated block into slide lines and measure it: returns
+    (kept_lines, used_display_lines, n_dropped). Leading list markers are stripped
+    from every line (long-content is plain text -- no bullets), while code
+    indentation on unmarked lines is preserved. Interior blank lines are kept,
+    leading and trailing blanks dropped, and the block is trimmed to the box.
+    n_dropped > 0 means the block did not fit and was cut -- which leaves the slide
+    ending mid-sentence, so callers should regenerate rather than ship it."""
+    raw = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    raw = [strip_long_bullet(x) for x in raw]           # Problem 4: no bullets here
+    while raw and not raw[0].strip():
+        raw.pop(0)
+    while raw and not raw[-1].strip():
+        raw.pop()
+    kept, used = [], 0
+    for ln in raw:
+        dl = count_display_lines(ln, usable_in, 0.0) if ln.strip() else 1
+        if kept and used + dl > capacity:
+            break
+        kept.append(ln)
+        used += dl
+    return kept, used, len(raw) - len(kept)
+
+
+def ensure_gap_below_title(slide, min_gap_in):
+    """Move the AI_content box down (shrinking its height to match) so its top sits
+    at least `min_gap_in` below the AI_title box's bottom edge. No-op when the gap
+    is already large enough. Stops the heading from overlapping the content on
+    long-content slides. Returns the distance moved, in inches."""
+    title = find_shape(slide, "AI_title")
+    content = find_shape(slide, "AI_content")
+    if title is None or content is None:
+        return 0.0
+    _, toy, _, tcy = geom_emu(title)
+    cox, coy, ccx, ccy = geom_emu(content)
+    need_top = toy + tcy + int(round(min_gap_in * EMU))
+    if coy >= need_top:
+        return 0.0
+    delta = need_top - coy
+    set_geom(content, cox, need_top, ccx, max(int(0.5 * EMU), ccy - delta))
+    return delta / EMU
+
+
+def trim_to_box_height(shape, lines):
+    """Absolute overflow guard: drop lines from the bottom until the block's
+    rendered height fits inside 100% of the box's usable height. `capacity` in
+    long_box_spec already leaves a margin, so this rarely fires -- it is the final
+    'never let text leave the box' backstop. Returns (kept_lines, used_lines)."""
+    _, _, cx, cy = geom_emu(shape)
+    ins = get_ins(shape)
+    usable = cx / EMU - ins["l"] - ins["r"]
+    usable_h = cy / EMU - ins["t"] - ins["b"]
+    max_disp = max(1, int(usable_h / (LINE_FACTOR * CONTENT_PT / 72.0)))
+    kept, used = [], 0
+    for ln in lines:
+        dl = count_display_lines(ln, usable, 0.0) if ln.strip() else 1
+        if kept and used + dl > max_disp:
+            break
+        kept.append(ln)
+        used += dl
+    return kept, used
+
+
+def generate_long_body(model, section, usable_in, capacity, max_lines, max_chars,
+                       min_lines):
+    """Generate a long-content block that both FILLS the box (>= min_lines display
+    lines) and FITS it complete (nothing trimmed). Under-full -> ask for more;
+    over-long -> ask for less, since a trimmed block ends mid-sentence or
+    mid-statement. Keeps the best candidate seen, preferring complete blocks.
+    Returns (kept_lines, used_lines, log)."""
+    log = []
+    best, best_used, best_score = [], 0, (-1, -1)
+    ask_min, ask_max, ask_chars = min_lines, max_lines, max_chars
+    for attempt in range(MAX_LONG_ITERS):
+        try:
+            body = stage2_long_content(model, section, ask_max, ask_chars, ask_min)
+        except Exception as exc:  # noqa: BLE001 - reported, then keep what we have
+            log.append(f"try{attempt + 1}: gen FAILED: {exc}")
+            break
+        time.sleep(API_CALL_DELAY)
+        kept, used, dropped = measure_long_body(body, usable_in, capacity)
+        pct = (100.0 * used / capacity) if capacity else 0.0
+        cut = f", CUT {dropped} line(s)" if dropped else ""
+        log.append(f"try{attempt + 1}: asked {ask_min}-{ask_max} -> {len(kept)} lines "
+                   f"-> {used} display lines ({pct:.0f}% of {capacity}; "
+                   f"need >= {min_lines}{cut})")
+
+        score = (0 if dropped else 1, used)      # complete beats fuller-but-cut
+        if score > best_score:
+            best, best_used, best_score = kept, used, score
+        if used >= min_lines and not dropped:
+            return kept, used, log
+
+        if dropped:
+            # Overflow is usually long lines WRAPPING, not too many lines: prose
+            # written at the char limit costs 2 display lines each. Tighten the
+            # per-line width as well as the line count.
+            wrapped = used > len(kept)
+            if wrapped:
+                ask_chars = max(40, int(ask_chars * 0.85))
+            fitted = max(min_lines, len(kept) - 1)
+            ask_max = max(min_lines, min(ask_max - 1, fitted) if not wrapped
+                          else ask_max)
+            ask_min = min(ask_min, ask_max)
+        else:                                    # under-full: push for more
+            ask_min = min(capacity, ask_min + max(2, min_lines // 3))
+            ask_max = max(ask_max, ask_min)
+    return best, best_used, log
+
+
+def prefetch_long_content(slots, spec, model, src_path, min_long):
+    """Generate every long-content block BEFORE the deck is cloned, so a slot whose
+    content comes back bullet-sized can be demoted back to a normal Bars/Hexagon
+    slide instead of leaving a mostly-empty huge box. Boxes are measured on the
+    template's own long-content slides. Caches the accepted block on the slot as
+    'long_body'. Returns a list of (slide_no, action, used, capacity) notes."""
+    rules = spec.get("long_content_rules", {})
+    demote_ok = rules.get("demote_if_underfull", True)
+    prs = open_template(src_path)
+    notes = []
+    n_long = sum(1 for s in slots if s["is_long"])
+
+    for i, slot in enumerate(slots, start=1):
+        if not slot["is_long"]:
+            continue
+        tmpl_shape = find_shape(prs.slides[slot["tmpl_idx"] - 1], "AI_content")
+        usable, cap, max_lines, max_chars, min_lines = long_box_spec(spec, tmpl_shape)
+        kept, used, log = generate_long_body(model, slot["section"], usable, cap,
+                                             max_lines, max_chars, min_lines)
+        slot["long_log"] = log
+        underfull = used < min_lines
+        # Rule: never leave bullet-sized content in a long box -- demote, unless
+        # that would drop the deck below its required minimum.
+        if underfull and demote_ok and n_long - 1 >= min_long:
+            slot["kind"] = slot.pop("orig_kind", slot["kind"])
+            slot["is_long"] = False
+            slot["tmpl_idx"] = slot["pre_long_tmpl_idx"]
+            slot["section"] = dict(slot["section"], needs_long_content=False)
+            n_long -= 1
+            notes.append((i, f"demoted to {slot['kind']} (only {used}/{cap} lines)",
+                          used, cap))
+        else:
+            slot["long_body"] = "\n".join(kept)
+            tag = "kept (under-full, required)" if underfull else "ok"
+            notes.append((i, tag, used, cap))
+    return notes
+
+
+def fill_long_content(slide, section, spec, model, slide_w_in, body=None):
+    """Fill a long-content slide (21/22): a short AI_title heading plus AI_content
+    as PLAIN multi-line text (no bullets), preserving line breaks and leading
+    indentation, trimmed to what the large box can hold. `body` is the block from
+    prefetch_long_content(); when None the model is called directly. Returns
+    (heading, kept_lines, used_lines, capacity, n_tech)."""
+    lc_ph = spec["placeholders"]["long_content"]
+
+    # 1) AI_title FIRST (short heading, <= 25 chars, forced to one line) so we know
+    #    exactly how much vertical room it occupies before placing the content.
+    heading = truncate(section.get("heading", ""),
+                       lc_ph["AI_title"]["max_chars"], ellipsis=True)
+    th = find_shape(slide, "AI_title")
+    if th is not None:
+        fill_simple(th, [heading])
+        tf, pt = run_font(th, "Impact", TITLE_PT_DEFAULT)
+        fit_title_width(slide, tf, pt, slide_w_in)
+        fix_title_geometry(slide, tf, pt)                # one-line height
+
+    # 2) Push the content box clear of the title, THEN measure the (final) box.
+    ensure_gap_below_title(slide, LONG_GAP_IN)
+    content_shape = find_shape(slide, "AI_content")
+    usable, capacity, max_lines, max_chars, min_lines = long_box_spec(
+        spec, content_shape)
+
+    # 3) Generate if needed, trim to the box (with an absolute height backstop),
+    #    and write as plain multi-line text (fill_simple adds no bullet).
+    if body is None:
+        body = stage2_long_content(model, section, max_lines, max_chars, min_lines)
+        time.sleep(API_CALL_DELAY)
+    kept, used, _dropped = measure_long_body(body, usable, capacity)
+    kept, used = trim_to_box_height(content_shape, kept)
+    fill_simple(content_shape, kept if kept else [""])
+
+    n_tech = sum(1 for ln in kept if _looks_technical(ln))
+    return heading, kept, used, capacity, n_tech
+
+
+# ---------------------------------------------------------------------------
 # Orchestration: generate_content (Gemini Stage 1) / fill_placeholders
 # (Gemini Stage 2 + write) / save_output
 # ---------------------------------------------------------------------------
@@ -1210,11 +1683,30 @@ def generate_content(topic, spec, sequence, model):
           f"1 Start + {wheel_count} Wheel + {bar_count} Bar + "
           f"{hex_count} Hexagon + 1 End")
 
+    min_long, max_long = long_content_limits(len(sequence), spec)
+    if max_long <= 0:
+        guidance = ("This template has no long-content slides: set "
+                    "\"needs_long_content\": false on every section.")
+    elif min_long > 0:
+        guidance = (f"This deck is {len(sequence)} slides -- a LONG deck. Mark AT LEAST "
+                    f"{min_long} and at most {max_long} sections "
+                    f"\"needs_long_content\": true. Longer decks carry more detailed "
+                    f"content, so at least one section must use the large box; aim for "
+                    f"{min_long}-{max_long} depending on how technical the topic is.")
+    else:
+        guidance = (f"This deck is {len(sequence)} slides -- a SHORTER deck. Mark 0-"
+                    f"{max_long} sections \"needs_long_content\": true. Zero is "
+                    f"perfectly fine for a simple overview topic; do not force a "
+                    f"long-content slide if the content works well as bullets.")
+
     print("\n=== STAGE 1: outline ===")
+    print(f"  long-content policy: min={min_long} max={max_long} "
+          f"(deck size {len(sequence)})")
     p1 = (STAGE1_PROMPT.replace("{TOPIC}", topic)
           .replace("{content_slide_count}", str(content_slide_count))
           .replace("{bar_count}", str(bar_count))
-          .replace("{hex_count}", str(hex_count)))
+          .replace("{hex_count}", str(hex_count))
+          .replace("{long_content_guidance}", guidance))
     outline = gemini_json(model, p1)
     time.sleep(API_CALL_DELAY)
 
@@ -1233,33 +1725,28 @@ def generate_content(topic, spec, sequence, model):
         print(f"     - {s.get('type'):7} heading={s.get('heading')!r} "
               f"topic={s.get('topic')!r}{lc}")
 
-    # Queue per section kind, keyed to match spec["placeholders"] ("bar" -> "bars").
-    queues = {"wheel": [], "bars": [], "hexagon": []}
-    for sec in sections:
-        stype = (sec.get("type") or "").lower()
-        key = "bars" if stype == "bar" else stype
-        queues.setdefault(key, []).append(sec)
-
     return {"title": title, "subtitle": subtitle, "wheel_tags": wheel_tags,
-            "queues": queues}
+            "sections": sections}
 
 
-def fill_placeholders(prs, content, spec, sequence, model):
-    """Gemini Stage 2 (adaptive, per-slide bullet generation measured against
-    each slide's actual content box) + write everything (title/subtitle/tags/
-    bullets) into `prs`. Returns a summary list of (slide#, kind, n_bullets,
-    n_wraps)."""
+def fill_placeholders(prs, content, spec, slots, model):
+    """Gemini Stage 2 + write everything into `prs`, iterating the routed `slots`
+    from route_plan(). Normal Wheel/Bar/Hexagon slots get adaptive, box-fitted
+    content (per-point format, fill 70-85%); LongContent slots get a plain
+    multi-line block (code / derivation / paragraph) with line breaks preserved.
+    Returns a summary list of (slide#, kind, n_items, n_lines, capacity, n_tech)."""
     slide_h_in = prs.slide_height / EMU
     slide_w_in = prs.slide_width / EMU
     marL = content_marL_emu()
     hang = marL / EMU
-    queues = content["queues"]
 
     print("\n=== STAGE 2 + FILL (per-point format, box-only constraint, fill 70-85%) ===")
     summary = []
-    long_flags = []
-    for i, (variant, _idx, _label) in enumerate(sequence):
+    long_routed = []
+    report = []     # per-slide: {slide, type, title, n, unit, fill}
+    for i, slot in enumerate(slots):
         slide = prs.slides[i]
+        variant = slot["kind"]
 
         if variant == "Start":
             _fill_shape_text(slide, "AI_title", [content["title"]])
@@ -1267,17 +1754,40 @@ def fill_placeholders(prs, content, spec, sequence, model):
             print(f"\nSlide {i + 1:2} Start")
             print(f"    title    : {content['title']!r}")
             print(f"    subtitle : {content['subtitle']!r}   (USER_info untouched)")
+            report.append({"slide": i + 1, "type": "Start", "title": content["title"],
+                           "n": None, "unit": "", "fill": None})
             continue
         if variant == "End":
+            report.append({"slide": i + 1, "type": "End", "title": "-",
+                           "n": None, "unit": "", "fill": None})
             continue
 
-        key = {"Wheel": "wheel", "Bars": "bars", "Hexagon": "hexagon"}[variant]
+        sec = slot["section"]
+
+        # ---- LongContent slot: plain multi-line block, no bullets -----------
+        if slot.get("is_long"):
+            heading, kept, used, cap, n_tech = fill_long_content(
+                slide, sec, spec, model, slide_w_in, body=slot.get("long_body"))
+            long_routed.append((i + 1, slot.get("orig_kind", "?"),
+                                heading, slot["tmpl_idx"]))
+            fill_pct = (100.0 * used / cap) if cap else 0.0
+            lc_max = spec["placeholders"]["long_content"]["AI_title"]["max_chars"]
+            print(f"\nSlide {i + 1:2} LongContent  "
+                  f"(was {slot.get('orig_kind')}, template slide {slot['tmpl_idx']})")
+            print(f"    heading={heading!r} ({len(heading)} chars, <= {lc_max})")
+            print(f"    -> {len(kept)} text lines -> {used} display lines "
+                  f"({fill_pct:.0f}% of {cap}-line box)  tech-lines={n_tech}  "
+                  f"[PLAIN TEXT, no bullets, indentation preserved]")
+            for ln in kept:
+                print(f"        | {ln}")
+            summary.append((i + 1, "LongContent", len(kept), used, cap, n_tech))
+            report.append({"slide": i + 1, "type": "LongContent", "title": heading,
+                           "n": len(kept), "unit": "lines", "fill": fill_pct})
+            continue
+
+        # ---- Normal Wheel / Bars / Hexagon slot -----------------------------
+        key = _KIND_TO_PH[variant]
         ph = spec["placeholders"][key]
-        default_sec = {"type": "bar" if key == "bars" else key,
-                       "heading": "", "topic": ""}
-        sec = queues[key].pop(0) if queues[key] else default_sec
-        if sec.get("needs_long_content"):
-            long_flags.append((i + 1, variant, sec.get("heading", "")))
 
         content_shape = find_shape(slide, "AI_content")
         _, _, cx, cy = geom_emu(content_shape)
@@ -1291,9 +1801,15 @@ def fill_placeholders(prs, content, spec, sequence, model):
 
         # headings / wheel tags
         if variant == "Wheel":
+            tag_ph = spec["placeholders"]["wheel"]
+            shown = []
             for ti, tag in enumerate(content["wheel_tags"], start=1):
-                _fill_shape_text(slide, f"AI_tag_{ti}", [tag])
-            head_line = f"tags={content['wheel_tags']}"
+                cfg = tag_ph.get(f"AI_tag_{ti}", tag_ph.get("AI_tag_1", {}))
+                tag_lines = wrap_to_lines(tag, cfg.get("max_chars_per_line", 18),
+                                          cfg.get("max_lines", 2))
+                _fill_shape_text(slide, f"AI_tag_{ti}", tag_lines)
+                shown.append(" / ".join(tag_lines))
+            head_line = f"tags={shown}"
         else:
             max_heading = ph["AI_title"]["max_chars"]
             heading = truncate(sec.get("heading", ""), max_heading, ellipsis=True)
@@ -1319,8 +1835,7 @@ def fill_placeholders(prs, content, spec, sequence, model):
         n_tech = sum(1 for b in final_bullets if _looks_technical(b))
         fill_pct = (100.0 * final_lines / capacity) if capacity else 0.0
 
-        print(f"\nSlide {i + 1:2} {variant}"
-              f"{'  [needs_long_content]' if sec.get('needs_long_content') else ''}")
+        print(f"\nSlide {i + 1:2} {variant}")
         print(f"    {head_line}")
         for step in log:
             print(f"    - {step}")
@@ -1332,19 +1847,32 @@ def fill_placeholders(prs, content, spec, sequence, model):
             print(f"        - {b}{mark}")
         summary.append((i + 1, variant, len(final_bullets), final_lines,
                         capacity, n_tech))
+        rep_title = " | ".join(shown) if variant == "Wheel" else heading
+        report.append({"slide": i + 1, "type": variant, "title": rep_title,
+                       "n": len(final_bullets), "unit": "bullets", "fill": fill_pct})
 
     print("\n=== SUMMARY: fill % and technical-line counts ===")
     for sidx, variant, nb, nlines, cap, ntech in summary:
         pct = (100.0 * nlines / cap) if cap else 0.0
-        print(f"   Slide {sidx:2} {variant:8}: items={nb} lines={nlines}/{cap} "
+        print(f"   Slide {sidx:2} {variant:11}: items={nb} lines={nlines}/{cap} "
               f"({pct:.0f}% full)  formula/code lines={ntech}")
 
-    if long_flags:
-        print("\n=== needs_long_content flagged (NOT routed) ===")
-        print("   The neon template has no long-content layout (slides 21-22 do "
-              "not exist), so these were filled in the normal box instead:")
-        for sidx, variant, heading in long_flags:
-            print(f"   Slide {sidx:2} {variant:8}: {heading!r}")
+    print("\n=== PER-SLIDE REPORT ===")
+    print(f"   {'#':>2}  {'type':11}  {'title':32}  {'count':>12}  fill")
+    print(f"   {'-' * 2}  {'-' * 11}  {'-' * 32}  {'-' * 12}  {'-' * 5}")
+    for r in report:
+        cnt = "-" if r["n"] is None else f"{r['n']} {r['unit']}"
+        pct = "n/a" if r["fill"] is None else f"{r['fill']:.0f}%"
+        title = truncate(r["title"] or "", 32)
+        print(f"   {r['slide']:>2}  {r['type']:11}  {title:32}  {cnt:>12}  {pct}")
+
+    if long_routed:
+        print("\n=== long-content slides routed (21/22) ===")
+        for sidx, orig, heading, tmpl in long_routed:
+            print(f"   Slide {sidx:2}: {heading!r}  (was {orig}, "
+                  f"template slide {tmpl})")
+    else:
+        print("\n(no long-content slides needed for this deck)")
     return summary
 
 
@@ -1355,8 +1883,9 @@ def save_output(prs, output_path):
 
 
 def generate_ai_deck(template_name, topic, count, output_path=None):
-    """End-to-end: load spec -> build the cloned deck -> Gemini outline
-    (Stage 1) -> per-slide adaptive bullets + write (Stage 2) -> save."""
+    """End-to-end: load spec -> Gemini outline (Stage 1) -> route long-content
+    sections onto slides 21/22 -> clone the planned slides -> Stage 2 fill
+    (adaptive bullets, or plain multi-line blocks for long-content) -> save."""
     folder = os.path.dirname(os.path.abspath(__file__))
     spec = load_spec(template_name)
     src = spec["_template_path"]
@@ -1367,12 +1896,214 @@ def generate_ai_deck(template_name, topic, count, output_path=None):
     model = load_gemini(folder)
     content = generate_content(topic, spec, seq, model)
 
-    build_deck(count, src, out, spec)
+    # Route needs_long_content sections onto the long-content template slides.
+    slots = route_plan(seq, content["sections"], spec)
+    min_long, max_long = long_content_limits(count, spec)
+    n_long = sum(1 for s in slots if s.get("is_long"))
+    forced = sum(1 for s in slots if s.get("forced_long"))
+    print(f"\n[route] {n_long} long-content slide(s) routed to template "
+          f"slides {[s['tmpl_idx'] for s in slots if s.get('is_long')] or '(none)'} "
+          f"(policy min={min_long} max={max_long}"
+          f"{f', {forced} promoted to meet the minimum' if forced else ''})")
+
+    # Generate the long blocks BEFORE cloning so an under-full one can be demoted
+    # back to a normal Bars/Hexagon slide rather than sitting in a huge empty box.
+    if n_long:
+        print("\n=== STAGE 2a: long-content blocks (>=60% fill required) ===")
+        for sno, action, used, cap in prefetch_long_content(
+                slots, spec, model, src, min_long):
+            print(f"   slide {sno:2}: {action}  [{used}/{cap} lines]")
+        for slot in slots:
+            for step in slot.get("long_log", []):
+                print(f"      - slot: {step}")
+        n_long = sum(1 for s in slots if s.get("is_long"))
+        print(f"   -> {n_long} long-content slide(s) after fill check")
+
+    build_deck_from_slots(slots, src, out)
     prs = Presentation(out)
 
-    fill_placeholders(prs, content, spec, seq, model)
+    fill_placeholders(prs, content, spec, slots, model)
 
-    print_inserted(prs)
+    save_output(prs, out)      # save BEFORE reporting: a printing failure must
+    print_inserted(prs)        # never cost a deck that is already complete
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Offline long-content test (no Gemini calls)
+#
+# run_build_tests() only walks build_slide_sequence(), so it never clones the
+# long-content template slides. This path does: it fabricates an outline with
+# two needs_long_content Bar sections, routes them through the real route_plan()
+# / build_deck_from_slots() / fill_long_content() code, and feeds Stage 2 from a
+# canned stub instead of the API.
+# ---------------------------------------------------------------------------
+_STUB_CODE_BLOCK = (
+    "def fizzbuzz(n):\n"
+    "    results = []\n"
+    "    for i in range(1, n + 1):\n"
+    "        if i % 15 == 0:\n"
+    "            results.append(\"FizzBuzz\")\n"
+    "        elif i % 3 == 0:\n"
+    "            results.append(\"Fizz\")\n"
+    "        elif i % 5 == 0:\n"
+    "            results.append(\"Buzz\")\n"
+    "        else:\n"
+    "            results.append(str(i))\n"
+    "    return results\n"
+    "\n"
+    "print(fizzbuzz(20))"
+)
+
+_STUB_PARAGRAPH = (
+    "A loop is a control structure that repeats a block of statements until a\n"
+    "condition stops holding. The for-loop walks a known sequence and is the right\n"
+    "choice when the number of iterations is fixed in advance; the while-loop keeps\n"
+    "going while a condition stays true and suits work whose length is not known\n"
+    "until it runs. Both can be exited early with break or advanced with continue.\n"
+    "\n"
+    "Choosing between them is a readability decision, not a performance one. If the\n"
+    "reader can see the bounds at a glance, prefer the for-loop; reach for while only\n"
+    "when the stopping condition is genuinely dynamic."
+)
+
+
+class _StubResponse:
+    def __init__(self, text):
+        self.text = text
+
+
+class _StubModel:
+    """Stands in for _FallbackModel in offline tests. Returns canned Stage 2
+    long-content JSON, picked by which heading appears in the prompt, and records
+    every call so the test can assert that zero real API traffic was needed."""
+
+    name = "stub (offline, no API calls)"
+
+    def __init__(self, by_heading):
+        self._by_heading = by_heading
+        self.calls = []
+
+    def generate_content(self, prompt):
+        for heading, body in self._by_heading.items():
+            if heading in prompt:
+                self.calls.append(heading)
+                return _StubResponse(json.dumps({"content": body}))
+        self.calls.append("(unmatched)")
+        return _StubResponse(json.dumps({"content": "stub content"}))
+
+
+def run_long_content_test(template_name="neon", output_path=None, count=8):
+    """Build a deck whose Bar sections are flagged needs_long_content so slides
+    21 and 22 are exercised end-to-end with dummy content -- a code block on 21
+    and a prose paragraph on 22 -- without contacting Gemini. Non-long slides get
+    static placeholder bullets through the normal fill path. Returns the output
+    path."""
+    global API_CALL_DELAY
+    folder = os.path.dirname(os.path.abspath(__file__))
+    spec = load_spec(template_name)
+    src = spec["_template_path"]
+    out = output_path or os.path.join(folder, "output_longcontent_test.pptx")
+
+    if "long_content" not in spec["sections"]:
+        raise ValueError(f"template {template_name!r} has no long_content section")
+
+    headings = ["FizzBuzz in Python", "What a loop is"]
+    model = _StubModel({headings[0]: _STUB_CODE_BLOCK,
+                        headings[1]: _STUB_PARAGRAPH})
+
+    # --- fabricate the outline Stage 1 would have returned -------------------
+    seq = build_slide_sequence(count, spec)
+    sections, n_flagged = [], 0
+    for kind, _idx, _label in seq:
+        if kind in ("Start", "End"):
+            continue
+        stype = {"Wheel": "wheel", "Bars": "bar", "Hexagon": "hexagon"}[kind]
+        flag = stype == "bar" and n_flagged < len(headings)
+        sections.append({
+            "type": stype,
+            "heading": headings[n_flagged] if flag else f"Test {stype} slide",
+            "topic": ("show the code" if flag and n_flagged == 0 else
+                      "explain loops in prose" if flag else
+                      f"placeholder {stype} content"),
+            "needs_long_content": flag,
+        })
+        if flag:
+            n_flagged += 1
+    content = {"title": "Loops", "subtitle": "Offline long-content test",
+               "wheel_tags": ["Definition", "For loop", "While loop"],
+               "sections": sections}
+
+    print("=" * 64)
+    print(f"LONG-CONTENT TEST ({count} slides, template {template_name!r}, no API)")
+    print("=" * 64)
+
+    slots = route_plan(seq, sections, spec)
+    long_idx = [s["tmpl_idx"] for s in slots if s["is_long"]]
+    print(f"[route] flagged sections: {n_flagged}; "
+          f"routed onto template slides {long_idx or '(none)'}")
+    for i, slot in enumerate(slots, start=1):
+        mark = "  <-- LONG" if slot["is_long"] else ""
+        print(f"   slide {i:2}  {slot['label']:3} -> {slot['kind']:11} "
+              f"(template {slot['tmpl_idx']}){mark}")
+    if not long_idx:
+        raise AssertionError("no sections were routed to long-content slides")
+
+    build_deck_from_slots(slots, src, out)
+    prs = Presentation(out)
+
+    # --- fill: long slots via the real path, others with static bullets ------
+    slide_h_in = prs.slide_height / EMU
+    slide_w_in = prs.slide_width / EMU
+    marL = content_marL_emu()
+    delay, API_CALL_DELAY = API_CALL_DELAY, 0.0     # no API -> no rate limiting
+    try:
+        for i, slot in enumerate(slots):
+            slide = prs.slides[i]
+            if slot["kind"] == "Start":
+                _fill_shape_text(slide, "AI_title", [content["title"]])
+                _fill_shape_text(slide, "AI_subtitle", [content["subtitle"]])
+                continue
+            if slot["kind"] == "End":
+                continue
+
+            sec = slot["section"]
+            if slot["is_long"]:
+                heading, kept, used, cap, n_tech = fill_long_content(
+                    slide, sec, spec, model, slide_w_in)
+                pct = (100.0 * used / cap) if cap else 0.0
+                print(f"\nSlide {i + 1:2} LongContent "
+                      f"(was {slot.get('orig_kind')}, template {slot['tmpl_idx']})")
+                print(f"    heading={heading!r}")
+                print(f"    -> {len(kept)} text lines -> {used} display lines "
+                      f"({pct:.0f}% of {cap}-line box)  tech-lines={n_tech}")
+                for ln in kept:
+                    print(f"        | {ln}")
+                continue
+
+            # plain placeholder bullets, written through the normal fill path
+            if slot["kind"] == "Wheel":
+                tag_ph = spec["placeholders"]["wheel"]
+                for ti, tag in enumerate(content["wheel_tags"], start=1):
+                    cfg = tag_ph.get(f"AI_tag_{ti}", tag_ph.get("AI_tag_1", {}))
+                    _fill_shape_text(slide, f"AI_tag_{ti}",
+                                     wrap_to_lines(tag, cfg.get("max_chars_per_line", 18),
+                                                   cfg.get("max_lines", 2)))
+            else:
+                _fill_shape_text(slide, "AI_title", [sec["heading"]])
+                th = find_shape(slide, "AI_title")
+                if th is not None:
+                    tf, pt = run_font(th, "Impact", TITLE_PT_DEFAULT)
+                    fit_title_width(slide, tf, pt, slide_w_in)
+                    fix_title_geometry(slide, tf, pt)
+            bullets = [f"Placeholder bullet {b}" for b in range(1, 4)]
+            fill_content_bullets(slide, bullets, slide_h_in, MIN_TOP_IN, marL)
+            print(f"\nSlide {i + 1:2} {slot['kind']:11} (placeholder bullets)")
+    finally:
+        API_CALL_DELAY = delay
+
+    print(f"\n[stub] Gemini calls made: 0 real, "
+          f"{len(model.calls)} served from the stub {model.calls}")
     save_output(prs, out)
     return out
 
@@ -1383,19 +2114,29 @@ def generate_ai_deck(template_name, topic, count, output_path=None):
 def parse_args():
     p = argparse.ArgumentParser(
         description="Fill a spec-driven PowerPoint template with AI-generated content.")
-    p.add_argument("--template", required=True,
+    p.add_argument("--template", default="neon",
                     help="Template name (folder under templates/, e.g. 'neon')")
-    p.add_argument("--topic", required=True, help="Presentation topic")
-    p.add_argument("--count", type=int, required=True, help="Target slide count")
+    p.add_argument("--topic", help="Presentation topic (required unless --test-long-content)")
+    p.add_argument("--count", type=int, help="Target slide count")
     p.add_argument("--output", default=None,
                     help="Output .pptx path (default: output_<template>.pptx)")
-    return p.parse_args()
+    p.add_argument("--test-long-content", action="store_true",
+                    help="Offline test: build a deck exercising the long-content "
+                         "slides with dummy content (no Gemini calls)")
+    args = p.parse_args()
+    if not args.test_long_content and (not args.topic or not args.count):
+        p.error("--topic and --count are required unless --test-long-content is set")
+    return args
 
 
 if __name__ == "__main__":
     args = parse_args()
     try:
-        generate_ai_deck(args.template, args.topic, args.count, args.output)
+        if args.test_long_content:
+            run_long_content_test(args.template, args.output,
+                                  count=args.count or 8)
+        else:
+            generate_ai_deck(args.template, args.topic, args.count, args.output)
     except Exception as exc:  # noqa: BLE001 - surface the failure clearly
         import traceback
         print(f"\n[ERROR] {type(exc).__name__}: {exc}")
