@@ -977,11 +977,11 @@ being made.
 The box is the ONLY hard constraint:
 - Each line must fit on ONE line in the box: at most about {max_chars} characters.
 - The box holds about {capacity} lines. FILL {target_min}-{target_max} of them
-  (70-85% of the box). Do not leave the box nearly empty, and do not overflow it.
+  ({fill_lo_pct}-{fill_hi_pct}% of the box). Do not leave the box nearly empty, and do not overflow it.
 - A formula, code line, or calculation counts toward the line budget exactly like a
   bullet does (one line each, unless it is short enough to share).
 - Never drop a major point. If space is tight, SHORTEN the wording of a point rather
-  than removing the point.
+  than removing the point.{extra}
 
 Style:
 - Descriptive lines: clean concrete phrases, start with a capital, no trailing period.
@@ -1162,11 +1162,14 @@ def gemini_json(model, prompt, retries=1):
     raise ValueError(f"invalid JSON after retry: {last}")
 
 
-def stage2_bullets(model, section, max_chars, capacity, target_min, target_max, rn):
+def stage2_bullets(model, section, max_chars, capacity, target_min, target_max, rn,
+                   fill_lo_pct=70, fill_hi_pct=85, extra=""):
     """Ask Gemini for the slide's content lines. Each returned line is whatever
     best communicates that point -- a bullet, a formula, a code line, or a short
     calculation -- constrained only by the box (max_chars per line, ~capacity
-    lines, fill target_min..target_max). Returns a list of raw line strings."""
+    lines, fill target_min..target_max, i.e. fill_lo_pct-fill_hi_pct% of the box).
+    `extra` carries optional per-section guidance (empty for box-only sections).
+    Returns a list of raw line strings."""
     prompt = (STAGE2_PROMPT
               .replace("{section.topic}", str(section.get("topic", "")))
               .replace("{section.heading}", str(section.get("heading", "")))
@@ -1174,7 +1177,10 @@ def stage2_bullets(model, section, max_chars, capacity, target_min, target_max, 
               .replace("{max_chars}", str(max_chars))
               .replace("{capacity}", str(capacity))
               .replace("{target_min}", str(target_min))
-              .replace("{target_max}", str(target_max)))
+              .replace("{target_max}", str(target_max))
+              .replace("{fill_lo_pct}", str(fill_lo_pct))
+              .replace("{fill_hi_pct}", str(fill_hi_pct))
+              .replace("{extra}", str(extra)))
     data = gemini_json(model, prompt)
     if not isinstance(data, dict):
         return []
@@ -1218,10 +1224,12 @@ def truncate(text, n, ellipsis=False):
 # No subject assumptions and no per-type "bullets-only" rule: each returned line
 # is whatever best communicates its point (bullet, formula, code, calculation),
 # and the sole hard constraint is the box -- ~max_chars per line and a line
-# capacity computed from the box height. We aim to FILL 70-85% of the box.
+# capacity computed from the box height. We aim to FILL 70-85% of the box by
+# default; a section's spec may override this (fill_target/max_lines) to keep a
+# smaller box -- e.g. the wheel intro boxes -- less packed.
 # ---------------------------------------------------------------------------
 CONTENT_LINE_H_IN = LINE_FACTOR * CONTENT_PT / 72.0   # one content line's height
-FILL_TARGET_LO = 0.70      # aim to fill at least this fraction of the box
+FILL_TARGET_LO = 0.70      # default: aim to fill at least this fraction of the box
 FILL_TARGET_HI = 0.85      # ... and at most this fraction
 FILL_UNDERFULL = 0.60      # below this -> regenerate asking for more detail
 
@@ -1277,27 +1285,62 @@ def _looks_technical(line):
     return has_math or has_code
 
 
+def _content_extra(spec_cfg, line_cap):
+    """Optional per-section guidance appended to the Stage 2 prompt. Only sections
+    that declare an explicit `max_bullets` in the spec (currently the wheel intro
+    boxes) get it; box-only sections (bars/hexagon) return "" so their prompt is
+    unchanged."""
+    mb = spec_cfg.get("max_bullets")
+    if not mb:
+        return ""
+    wpb = spec_cfg.get("words_per_bullet", [4, 6])
+    wrap = spec_cfg.get("allow_wrap", [1, 2])
+    return ("\n- This is an intro/definition box: aim for about "
+            f"{mb[0]}-{mb[1]} substantive bullets of roughly {wpb[0]}-{wpb[1]} "
+            f"words each, at most {line_cap} lines total. Most bullets should sit "
+            f"on one line, but {wrap[0]}-{wrap[1]} may wrap to a second line. Fill "
+            "the box without overflowing, and do not drop a key point.")
+
+
 def adaptive_bullets(model, section, usable_in, hang_in, ph_content_spec, capacity):
-    """Generate the slide's content lines, filling 70-85% of the box.
+    """Generate the slide's content lines, filling a target fraction of the box.
 
     Requests content sized to the box (max_chars/line + fill target derived from
     `capacity`), measures the rendered line total with Pillow, and regenerates
-    once or twice if the box is under-full (<60%) or overflowing (>100%). Points
-    are never dropped here -- the model is asked to shorten instead. Returns
-    (lines, total_lines, log). `ph_content_spec` is accepted for signature
-    compatibility but the box now drives everything.
+    once or twice if the box is under-full or overflowing. Points are never
+    dropped here -- the model is asked to shorten instead. Returns
+    (lines, total_lines, log).
+
+    The fill target defaults to FILL_TARGET_LO..HI (70-85%), but a section's spec
+    (`ph_content_spec`) may override it with `fill_target` [lo, hi] and cap the
+    rendered lines with `max_lines` -- used to keep the smaller wheel intro boxes
+    (70-80%, <=10 lines, mostly one-line bullets) less packed. With no overrides
+    the behaviour is identical to before, so bars/hexagon are unaffected.
     """
+    spec_cfg = ph_content_spec or {}
+    lo, hi = spec_cfg.get("fill_target", [FILL_TARGET_LO, FILL_TARGET_HI])
+    underfull = spec_cfg.get("fill_underfull", FILL_UNDERFULL)
+    # Hard ceiling on rendered lines (default: the whole box). Lets a shorter
+    # intro box (wheel) stay less packed than its raw height would allow.
+    line_cap = min(capacity, int(spec_cfg.get("max_lines", capacity)))
+
     max_chars = approx_chars_per_line(usable_in)
-    target_min = max(1, round(FILL_TARGET_LO * capacity))
-    target_max = max(target_min, int(FILL_TARGET_HI * capacity))
-    low_water = max(1, int(FILL_UNDERFULL * capacity))
+    target_min = max(1, round(lo * capacity))
+    target_max = max(target_min, int(hi * capacity))
+    target_max = min(target_max, line_cap)          # never exceed the line cap
+    target_min = min(target_min, target_max)
+    low_water = min(max(1, int(underfull * capacity)), target_max)
+    fill_lo_pct = int(round(lo * 100))
+    fill_hi_pct = int(round(hi * 100))
+    extra = _content_extra(spec_cfg, line_cap)
     rn = role_note(section.get("type"))
     log = []
     last = []
     for attempt in range(MAX_BULLET_ITERS):
         try:
             raw = stage2_bullets(model, section, max_chars, capacity,
-                                 target_min, target_max, rn)
+                                 target_min, target_max, rn,
+                                 fill_lo_pct, fill_hi_pct, extra)
         except Exception as exc:  # noqa: BLE001 - reported, then fall back
             log.append(f"try{attempt + 1}: gen FAILED: {exc}")
             time.sleep(API_CALL_DELAY)
@@ -1308,16 +1351,17 @@ def adaptive_bullets(model, section, usable_in, hang_in, ph_content_spec, capaci
         total = total_display_lines(items, usable_in, hang_in)
         pct = (100.0 * total / capacity) if capacity else 0.0
         log.append(f"try{attempt + 1}: {len(items)} items -> {total} lines "
-                   f"(cap {capacity}, {pct:.0f}% full; target {target_min}-{target_max})")
+                   f"(cap {capacity}, cap_lines {line_cap}, {pct:.0f}% full; "
+                   f"target {target_min}-{target_max})")
         last = items
-        if total > capacity:                    # overflow -> ask to shorten/fewer
-            target_max = max(target_min, capacity - 1)
+        if total > line_cap:                    # overflow -> ask to shorten/fewer
+            target_max = max(target_min, line_cap - 1)
             continue
         if total < low_water:                   # under-full -> ask for more detail
-            target_min = min(capacity, target_max + 1)
-            target_max = capacity
+            target_min = min(line_cap, target_max + 1)
+            target_max = line_cap
             continue
-        return items, total, log                # 60-100% full -> accept
+        return items, total, log                # in-range -> accept
 
     # did not converge: keep the last set. fill_content_bullets grows the box to
     # fit, and only drops as an absolute last resort.
@@ -1732,7 +1776,8 @@ def generate_content(topic, spec, sequence, model):
 def fill_placeholders(prs, content, spec, slots, model):
     """Gemini Stage 2 + write everything into `prs`, iterating the routed `slots`
     from route_plan(). Normal Wheel/Bar/Hexagon slots get adaptive, box-fitted
-    content (per-point format, fill 70-85%); LongContent slots get a plain
+    content (per-point format, fill target per section -- 70-85% by default,
+    70-80% for the smaller wheel boxes); LongContent slots get a plain
     multi-line block (code / derivation / paragraph) with line breaks preserved.
     Returns a summary list of (slide#, kind, n_items, n_lines, capacity, n_tech)."""
     slide_h_in = prs.slide_height / EMU
@@ -1740,7 +1785,7 @@ def fill_placeholders(prs, content, spec, slots, model):
     marL = content_marL_emu()
     hang = marL / EMU
 
-    print("\n=== STAGE 2 + FILL (per-point format, box-only constraint, fill 70-85%) ===")
+    print("\n=== STAGE 2 + FILL (per-point format, box-fitted, per-section fill target) ===")
     summary = []
     long_routed = []
     report = []     # per-slide: {slide, type, title, n, unit, fill}
@@ -1795,7 +1840,8 @@ def fill_placeholders(prs, content, spec, slots, model):
         usable = cx / EMU - ins["l"] - ins["r"]
         capacity = box_line_capacity(cy, ins)
 
-        # box-driven content generation (per-point format, fill 70-85% of the box)
+        # box-driven content generation (per-point format; fill target + line cap
+        # come from the section's spec, defaulting to 70-85% of the box)
         bullets, _tot, log = adaptive_bullets(
             model, sec, usable, hang, ph["AI_content"], capacity)
 
