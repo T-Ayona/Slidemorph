@@ -22,7 +22,7 @@ from collections import defaultdict, deque
 import streamlit as st
 from dotenv import load_dotenv
 
-from fill_template import generate_ai_deck
+from fill_template import generate_ai_deck, output_filename
 
 load_dotenv()  # local dev: pull GEMINI_API_KEY from .env into os.environ
 
@@ -86,16 +86,19 @@ def rate_check(cid):
 
 
 def generate(topic, count, template):
-    """Run the pipeline. Returns (out_path, error_message); one is always None."""
-    safe_topic = "".join(c if c.isalnum() else "_" for c in topic)[:40] or "deck"
-    out_name = f"{template}_{safe_topic}_{int(time.time())}.pptx"
-    out_path = os.path.join(OUTPUT_DIR, out_name)
+    """Run the pipeline. Returns (out_path, download_name, error_message); the
+    first two are None on failure. `download_name` is the clean, user-facing
+    '{topic}_{template}.pptx'; the on-disk name is prefixed with a timestamp so
+    concurrent generations never overwrite each other."""
+    download_name = output_filename(topic, template)
+    disk_name = f"{int(time.time())}_{download_name}"
+    out_path = os.path.join(OUTPUT_DIR, disk_name)
     try:
         generate_ai_deck(template, topic, int(count), out_path)
     except Exception as exc:  # noqa: BLE001 - surface any pipeline error to the UI
         traceback.print_exc()
-        return None, f"{type(exc).__name__}: {exc}"
-    return out_path, None
+        return None, None, f"{type(exc).__name__}: {exc}"
+    return out_path, download_name, None
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +128,7 @@ if st.button("Generate", type="primary"):
         else:
             with st.spinner(f"Generating {count} slides on {topic.strip()!r}… "
                             "this takes a minute."):
-                out_path, error = generate(topic.strip(), count, template)
+                out_path, download_name, error = generate(topic.strip(), count, template)
             if error:
                 st.session_state.pop("result", None)
                 st.error(f"Generation failed: {error}")
@@ -135,7 +138,7 @@ if st.button("Generate", type="primary"):
                 with open(out_path, "rb") as f:
                     st.session_state["result"] = {
                         "data": f.read(),
-                        "name": os.path.basename(out_path),
+                        "name": download_name,
                         "count": count,
                         "topic": topic.strip(),
                     }

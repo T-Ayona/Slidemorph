@@ -46,6 +46,8 @@ import sys
 import copy
 import json
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Generated content routinely contains characters the Windows console codepage
 # (cp1252) cannot encode -- Greek letters in complexity notation, en-dashes, box
@@ -95,7 +97,7 @@ GEMINI_MODELS = ["gemini-2.0-flash", "gemini-flash-latest", "gemini-2.5-flash",
                  "gemini-flash-lite-latest", "gemini-3.5-flash-lite"]
 QUOTA_RETRY_CAP = 45.0                      # max seconds to wait on a rate-limit
 MAX_QUOTA_WAITS = 2                         # wait+retry attempts on the last model
-API_CALL_DELAY = 2.0                        # seconds between calls (rate limiting)
+API_CALL_DELAY = 1.0                        # seconds between calls (rate limiting)
 
 # Bundled fonts live next to this file in ./fonts/, so measurements are
 # identical on Windows, macOS, and Linux (no dependency on system fonts).
@@ -902,27 +904,58 @@ def run_build_tests(template_name="neon"):
 # ---------------------------------------------------------------------------
 # Gemini AI content generation
 # ---------------------------------------------------------------------------
-STAGE1_PROMPT = """You are a presentation content writer. Given a topic and a slide count, create an outline.
+STAGE1_PROMPT = """You are creating a presentation outline. Given a topic and a slide count, plan the deck.
 
 Topic: {TOPIC}
 Total content slides: {content_slide_count} (this is TARGET_SLIDE_COUNT minus 2, since Start and End are not content)
 
-The content slides are divided into sections by PRESENTATION ROLE (this is about structure, not about the subject):
-- WHEEL slides: introduce and define the main concepts (shorter boxes).
-- BAR slides: the main body -- detailed explanation, one subtopic per slide (bigger boxes).
-- HEXAGON slides: applications, examples, or summary/conclusions.
+Build a NATURAL NARRATIVE FLOW that fits THIS specific topic. Every presentation should:
+
+1. START WITH INTRODUCTION / CONTEXT -- what is this topic, why does it matter, what
+   will be covered. Give the audience footing before any technical content.
+2. PROGRESS FROM GENERAL TO SPECIFIC -- introduce the big picture first, then drill into
+   details, examples, and specifics. Never open with a technical detail before
+   introducing what it belongs to.
+3. GROUP RELATED CONTENT TOGETHER -- if the topic has categories or types, discuss each
+   category as a coherent block before moving to the next. Do not jump between unrelated
+   details.
+4. GIVE EACH SLIDE ONE FOCUS -- the slide heading defines exactly what that slide
+   discusses, and the content stays on that one focus. Do not cram multiple topics onto
+   one slide.
+5. END WITH SYNTHESIS -- applications, key takeaways, or conclusions that tie things
+   together.
+6. MAKE SECTIONS CONNECT -- each new section should logically follow from the previous
+   one, so the reader feels a story unfolding, not a random list of facts.
+
+Add examples where they help -- a formula, an equation, a syntax/code snippet, a short
+calculation, or a concrete case -- whenever the point calls for it. ANY subject may need
+these: business has ROI and break-even formulas, biology has growth equations, economics
+has calculations, programming has code/syntax. Do NOT assume the subject has or lacks
+technical content; that is decided per point in the next stage. Here, just plan headings
+and per-slide topics so the flow is coherent.
+
+The specific sections depend ENTIRELY on the topic -- do NOT force a template. For a
+technical topic you might go concepts -> categories -> examples -> applications. For a
+historical topic: context -> timeline -> key figures -> consequences. For a business
+topic: problem -> solution -> market -> execution. Choose whatever flow makes THIS topic
+understandable.
+
+The slides are grouped by PRESENTATION ROLE (structure, not subject). Use these roles to
+place your narrative:
+- WHEEL slides (the first 3 content slides): introduce and DEFINE the main
+  concepts/pillars of the topic. Each wheel slide focuses on ONE pillar. The three
+  wheel_tags ARE those three pillars, in order -- wheel_tags[0] is the first wheel
+  slide's focus, wheel_tags[1] the second, wheel_tags[2] the third. Make the three wheel
+  sections define exactly those three pillars, one per slide, in the same order.
+- BAR slides (the middle): the main body -- detailed explanations, methods, categories,
+  worked examples. One subtopic per slide, grouped so related bars sit together.
+- HEXAGON slides (later): applications, use cases, comparisons, evaluations, or the
+  closing synthesis.
 
 For this presentation there are:
 - 3 Wheel slides
 - {bar_count} Bar slides
 - {hex_count} Hexagon slides
-
-Do NOT assume anything about the subject's content type. ANY subject may need formulas,
-equations, code, calculations, or quotes on a given slide -- business has ROI and
-break-even formulas, biology has growth equations, economics has calculations,
-programming has code, etc. -- and any subject may also be purely descriptive on a given
-slide. That decision is made per point in the next stage, from the actual content, not
-from the subject. Here, just plan the topics.
 
 For sections with detailed content -- full code examples, step-by-step calculations,
 algorithms, detailed explanations, or important quotes -- mark them as
@@ -943,11 +976,11 @@ Return ONLY a JSON object, no markdown, no explanation:
 {
   "title": "short title, max 20 chars",
   "subtitle": "subtitle, max 30 chars",
-  "wheel_tags": ["tag1", "tag2", "tag3"],
+  "wheel_tags": ["pillar1", "pillar2", "pillar3"],
   "sections": [
-    {"type": "wheel", "variant": 1, "heading": "max 14 chars", "topic": "what this slide covers", "needs_long_content": false},
-    {"type": "bar", "variant": 1, "heading": "max 25 chars", "topic": "what this slide covers", "needs_long_content": false},
-    {"type": "hexagon", "variant": 1, "heading": "max 25 chars", "topic": "what this slide covers", "needs_long_content": false}
+    {"type": "wheel", "variant": 1, "heading": "max 14 chars", "topic": "define ONLY this pillar", "needs_long_content": false},
+    {"type": "bar", "variant": 1, "heading": "max 25 chars", "topic": "what this ONE slide covers", "needs_long_content": false},
+    {"type": "hexagon", "variant": 1, "heading": "max 25 chars", "topic": "what this ONE slide covers", "needs_long_content": false}
   ]
 }
 
@@ -955,17 +988,31 @@ Rules:
 - title max 20 characters
 - subtitle max 30 characters
 - bar and hexagon headings max 25 characters (must fit on ONE line)
-- wheel_tags are the 3 labels on the wheel; each may wrap to 2 lines, so up to
+- wheel_tags are the 3 pillars shown on the wheel; each may wrap to 2 lines, so up to
   about 36 characters total (max 18 per line). Prefer short labels, but full words
   are fine -- they will wrap rather than being cut off
+- The 3 wheel sections define wheel_tags[0], [1], [2] respectively -- one pillar each,
+  same order, and their "topic" must stay on that single pillar only.
+- Order the bar and hexagon sections so the narrative flows: general before specific,
+  related subtopics grouped together, each section a natural continuation of the last.
+- Every section "heading" is that slide's single focus; its "topic" must describe only
+  what that one slide covers, with no overlap into other slides.
 - sections must have exactly {content_slide_count} entries
 - Keep all headings short enough to never wrap to a second line"""
 
 STAGE2_PROMPT = """Write the on-slide content for ONE presentation slide.
 
+THIS SLIDE'S FOCUS (discuss ONLY this): {focus}
 Topic of this slide: {section.topic}
 Heading: {section.heading}
 Slide role: {role_note}
+
+Continuity (for context only -- do NOT write about these):
+- The previous slide covered: {prev_topic}. Do not repeat it.
+- The next slide will cover: {next_topic}. Do not steal that content.
+
+Stay STRICTLY on this slide's focus/heading. Write only about "{focus}". Do not discuss
+what other slides cover, and do not turn this into an overview of the whole topic.
 
 For each point, choose the clearest way to present it. Use bullets for descriptive
 information. If a specific point is best explained with a formula, equation, code
@@ -997,6 +1044,9 @@ STAGE2_LONG_PROMPT = """Write the FULL-DETAIL content for ONE large presentation
 
 Topic of this slide: {section.topic}
 Heading: {section.heading}
+
+Stay STRICTLY on this slide's heading/topic. Do not drift into material that belongs on
+other slides; this one block is about "{section.heading}" only.
 
 This slide has a MASSIVE box (10.9 inches wide, 5 inches tall). It exists because the
 point needs a big block that does NOT work as short bullets -- a full code example (a
@@ -1076,6 +1126,7 @@ class _FallbackModel:
         self._names = list(model_names)
         self._i = 0
         self._model = genai.GenerativeModel(self._names[0])
+        self._lock = threading.Lock()
 
     @property
     def name(self):
@@ -1084,29 +1135,36 @@ class _FallbackModel:
     def generate_content(self, prompt):
         waits = 0
         while True:
+            with self._lock:
+                model = self._model
+                model_idx = self._i
             try:
-                return self._model.generate_content(prompt)
+                return model.generate_content(prompt)
             except Exception as exc:  # noqa: BLE001 - inspected, then re-raised
-                skip = _is_quota_error(exc) or _is_unavailable_error(exc)
-                if skip and self._i + 1 < len(self._names):     # switch models
-                    old = self._names[self._i]
-                    reason = "quota" if _is_quota_error(exc) else "unavailable"
-                    self._i += 1
-                    print(f"    [{reason}] {old} -> falling back to "
-                          f"{self._names[self._i]}")
-                    self._model = self._genai.GenerativeModel(self._names[self._i])
-                    time.sleep(API_CALL_DELAY)
-                    waits = 0
-                    continue
-                if _is_quota_error(exc) and waits < MAX_QUOTA_WAITS:  # last model
-                    delay = min(_retry_seconds(exc) or QUOTA_RETRY_CAP,
-                                QUOTA_RETRY_CAP)
-                    waits += 1
-                    print(f"    [quota] {self.name} rate-limited; waiting "
-                          f"{delay:.0f}s then retrying ({waits}/{MAX_QUOTA_WAITS})")
-                    time.sleep(delay)
-                    continue
-                raise
+                quota_delay = None
+                with self._lock:
+                    skip = _is_quota_error(exc) or _is_unavailable_error(exc)
+                    if skip and self._i != model_idx:
+                        waits = 0
+                    elif skip and self._i + 1 < len(self._names):
+                        old = self._names[self._i]
+                        reason = "quota" if _is_quota_error(exc) else "unavailable"
+                        self._i += 1
+                        print(f"    [{reason}] {old} -> falling back to "
+                              f"{self._names[self._i]}")
+                        self._model = self._genai.GenerativeModel(self._names[self._i])
+                        waits = 0
+                    elif _is_quota_error(exc) and waits < MAX_QUOTA_WAITS:
+                        quota_delay = min(_retry_seconds(exc) or QUOTA_RETRY_CAP,
+                                          QUOTA_RETRY_CAP)
+                        waits += 1
+                        print(f"    [quota] {self.name} rate-limited; waiting "
+                              f"{quota_delay:.0f}s then retrying "
+                              f"({waits}/{MAX_QUOTA_WAITS})")
+                    else:
+                        raise
+                time.sleep(quota_delay if quota_delay is not None
+                           else API_CALL_DELAY)
 
 
 def load_gemini(folder):
@@ -1151,7 +1209,10 @@ def gemini_json(model, prompt, retries=1):
     """Call Gemini, strip fences, parse JSON. Retry once on invalid JSON."""
     last = None
     for attempt in range(retries + 1):
+        t0 = time.time()
         raw = _resp_text(model.generate_content(prompt))
+        dt = time.time() - t0
+        print(f"    [perf] Gemini API call took {dt:.2f}s (model={model.name})")
         try:
             return json.loads(_strip_fences(raw))
         except (json.JSONDecodeError, ValueError) as e:
@@ -1163,14 +1224,24 @@ def gemini_json(model, prompt, retries=1):
 
 
 def stage2_bullets(model, section, max_chars, capacity, target_min, target_max, rn,
-                   fill_lo_pct=70, fill_hi_pct=85, extra=""):
+                   fill_lo_pct=70, fill_hi_pct=85, extra="",
+                   focus="", prev_topic="", next_topic=""):
     """Ask Gemini for the slide's content lines. Each returned line is whatever
     best communicates that point -- a bullet, a formula, a code line, or a short
     calculation -- constrained only by the box (max_chars per line, ~capacity
     lines, fill target_min..target_max, i.e. fill_lo_pct-fill_hi_pct% of the box).
     `extra` carries optional per-section guidance (empty for box-only sections).
+    `focus` is the single thing this slide must discuss (the middle wheel tag, or
+    the bar/hexagon heading); `prev_topic`/`next_topic` give continuity so the
+    slide neither repeats the previous slide nor steals the next one's content.
     Returns a list of raw line strings."""
+    focus = focus or section.get("focus_tag") or section.get("heading", "")
+    prev_topic = (prev_topic or "").strip() or "(nothing -- this is the first content slide)"
+    next_topic = (next_topic or "").strip() or "(nothing -- this is the last content slide)"
     prompt = (STAGE2_PROMPT
+              .replace("{focus}", str(focus))
+              .replace("{prev_topic}", prev_topic)
+              .replace("{next_topic}", next_topic)
               .replace("{section.topic}", str(section.get("topic", "")))
               .replace("{section.heading}", str(section.get("heading", "")))
               .replace("{role_note}", str(rn))
@@ -1263,6 +1334,34 @@ def box_line_capacity(cy_emu, ins):
     return max(1, int(usable_h / CONTENT_LINE_H_IN))
 
 
+def wheel_focus_index(slide):
+    """Which AI_tag_N shape sits in the wheel's MIDDLE (focus) position on this
+    wheel slide. The template stacks two tags on the left and places the third
+    near the wheel (furthest to the right); that right-most tag is the slide's
+    focus. Returns the 1-based tag index N (so its text is wheel_tags[N-1]), or
+    None if the slide has no AI_tag_* shapes. Purely geometry-driven, so it works
+    for any wheel layout without hardcoding which slide focuses on which tag."""
+    best_n, best_cx = None, None
+    for n in (1, 2, 3):
+        sh = find_shape(slide, f"AI_tag_{n}")
+        if sh is None:
+            continue
+        ox, _oy, cx, _cy = geom_emu(sh)
+        center_x = ox + cx / 2.0
+        if best_cx is None or center_x > best_cx:
+            best_cx, best_n = center_x, n
+    return best_n
+
+
+def wheel_focus_tag(slide, wheel_tags):
+    """The text of this wheel slide's focus (middle) tag, from wheel_tags. Falls
+    back to the first tag if geometry detection or the index is unavailable."""
+    n = wheel_focus_index(slide)
+    if n is not None and wheel_tags and 1 <= n <= len(wheel_tags):
+        return wheel_tags[n - 1]
+    return wheel_tags[0] if wheel_tags else ""
+
+
 def role_note(stype):
     """Structural (NOT subject) role blurb passed to the Stage 2 prompt."""
     return {
@@ -1302,8 +1401,13 @@ def _content_extra(spec_cfg, line_cap):
             "the box without overflowing, and do not drop a key point.")
 
 
-def adaptive_bullets(model, section, usable_in, hang_in, ph_content_spec, capacity):
+def adaptive_bullets(model, section, usable_in, hang_in, ph_content_spec, capacity,
+                     focus="", prev_topic="", next_topic=""):
     """Generate the slide's content lines, filling a target fraction of the box.
+
+    `focus` is the single thing the slide must discuss (wheel middle tag or
+    bar/hexagon heading); `prev_topic`/`next_topic` are the neighbouring slides'
+    focuses, passed to Stage 2 for continuity so slides don't overlap.
 
     Requests content sized to the box (max_chars/line + fill target derived from
     `capacity`), measures the rendered line total with Pillow, and regenerates
@@ -1340,7 +1444,8 @@ def adaptive_bullets(model, section, usable_in, hang_in, ph_content_spec, capaci
         try:
             raw = stage2_bullets(model, section, max_chars, capacity,
                                  target_min, target_max, rn,
-                                 fill_lo_pct, fill_hi_pct, extra)
+                                 fill_lo_pct, fill_hi_pct, extra,
+                                 focus, prev_topic, next_topic)
         except Exception as exc:  # noqa: BLE001 - reported, then fall back
             log.append(f"try{attempt + 1}: gen FAILED: {exc}")
             time.sleep(API_CALL_DELAY)
@@ -1773,23 +1878,101 @@ def generate_content(topic, spec, sequence, model):
             "sections": sections}
 
 
-def fill_placeholders(prs, content, spec, slots, model):
+def fill_placeholders(prs, content, spec, slots, model, topic=""):
     """Gemini Stage 2 + write everything into `prs`, iterating the routed `slots`
     from route_plan(). Normal Wheel/Bar/Hexagon slots get adaptive, box-fitted
     content (per-point format, fill target per section -- 70-85% by default,
     70-80% for the smaller wheel boxes); LongContent slots get a plain
     multi-line block (code / derivation / paragraph) with line breaks preserved.
+
+    Each slide's content is generated for ONE focus only -- a wheel slide's focus
+    is its MIDDLE tag (detected by geometry), a bar/hexagon slide's focus is its
+    heading -- and each generation is told what the previous and next slides cover
+    so slides stay on-topic and don't overlap.
+
     Returns a summary list of (slide#, kind, n_items, n_lines, capacity, n_tech)."""
     slide_h_in = prs.slide_height / EMU
     slide_w_in = prs.slide_width / EMU
     marL = content_marL_emu()
     hang = marL / EMU
+    wheel_tags = content.get("wheel_tags") or []
 
-    print("\n=== STAGE 2 + FILL (per-point format, box-fitted, per-section fill target) ===")
+    print("\n=== STAGE 2 + FILL (per-slide focus, box-fitted, continuity-aware) ===")
+
+    # --- Per-slot focus/title (drives each slide's content AND the prev/next
+    #     continuity context). Wheel focus is the middle tag (geometry-detected);
+    #     bar/hexagon/long focus is the heading. Stashed on the slot for reuse. --
+    slot_titles = []
+    for j, s in enumerate(slots):
+        k = s["kind"]
+        if k == "Start":
+            title = content.get("title", "")
+        elif k == "End":
+            title = "Summary / conclusion"
+        elif k == "Wheel":
+            title = wheel_focus_tag(prs.slides[j], wheel_tags)
+            s["focus"] = title
+        else:                                   # Bars / Hexagon / LongContent
+            title = (s.get("section") or {}).get("heading", "")
+            s["focus"] = title
+        slot_titles.append(title)
+
+    def neighbour(j, step):
+        """Focus/title of the slide `step` away from j, skipping Start/End so a
+        content slide's continuity refers to real content, not the cover."""
+        j += step
+        while 0 <= j < len(slots) and slots[j]["kind"] in ("Start", "End"):
+            j += step
+        return slot_titles[j] if 0 <= j < len(slots) else ""
+
+    # --- Parallel content generation for all normal slides ---------------------
+    gen_tasks = {}
+    for gi, gslot in enumerate(slots):
+        gv = gslot["kind"]
+        if gv in ("Start", "End") or gslot.get("is_long"):
+            continue
+        gslide = prs.slides[gi]
+        gkey = _KIND_TO_PH[gv]
+        gph = spec["placeholders"][gkey]
+        gshape = find_shape(gslide, "AI_content")
+        _, _, gcx, gcy = geom_emu(gshape)
+        gins = get_ins(gshape)
+        gusable = gcx / EMU - gins["l"] - gins["r"]
+        gcap = box_line_capacity(gcy, gins)
+        gfocus = gslot.get("focus", "")
+        if gv == "Wheel":
+            # Wheel content is about the MIDDLE tag only -- build a section fixed
+            # on that pillar instead of the outline's (possibly all-encompassing)
+            # wheel topic, so the box never turns into an overview of every tag.
+            gsec = {"type": "wheel", "heading": gfocus, "focus_tag": gfocus,
+                    "topic": (f"Introduce and define '{gfocus}', one core concept of "
+                              f"{topic}. Cover ONLY {gfocus} -- not the other concepts.")}
+        else:
+            gsec = gslot["section"]
+        gen_tasks[gi] = (gsec, gusable, gph["AI_content"], gcap, gfocus,
+                         neighbour(gi, -1), neighbour(gi, +1))
+
+    t_parallel = time.time()
+    print(f"  Generating content for {len(gen_tasks)} slides in parallel "
+          f"(max_workers=3)...")
+    gen_results = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {}
+        for idx, (sec_p, us_p, phc_p, cap_p, foc_p, prev_p, next_p) in gen_tasks.items():
+            f = pool.submit(adaptive_bullets, model, sec_p, us_p, hang,
+                            phc_p, cap_p, foc_p, prev_p, next_p)
+            futures[f] = idx
+        for f in as_completed(futures):
+            gen_results[futures[f]] = f.result()
+    print(f"  All {len(gen_results)} slides generated in "
+          f"{time.time() - t_parallel:.2f}s")
+
     summary = []
     long_routed = []
     report = []     # per-slide: {slide, type, title, n, unit, fill}
+    slide_times = []
     for i, slot in enumerate(slots):
+        t_slide = time.time()
         slide = prs.slides[i]
         variant = slot["kind"]
 
@@ -1801,10 +1984,12 @@ def fill_placeholders(prs, content, spec, slots, model):
             print(f"    subtitle : {content['subtitle']!r}   (USER_info untouched)")
             report.append({"slide": i + 1, "type": "Start", "title": content["title"],
                            "n": None, "unit": "", "fill": None})
+            slide_times.append((i + 1, "Start", time.time() - t_slide))
             continue
         if variant == "End":
             report.append({"slide": i + 1, "type": "End", "title": "-",
                            "n": None, "unit": "", "fill": None})
+            slide_times.append((i + 1, "End", time.time() - t_slide))
             continue
 
         sec = slot["section"]
@@ -1828,6 +2013,7 @@ def fill_placeholders(prs, content, spec, slots, model):
             summary.append((i + 1, "LongContent", len(kept), used, cap, n_tech))
             report.append({"slide": i + 1, "type": "LongContent", "title": heading,
                            "n": len(kept), "unit": "lines", "fill": fill_pct})
+            slide_times.append((i + 1, "LongContent", time.time() - t_slide))
             continue
 
         # ---- Normal Wheel / Bars / Hexagon slot -----------------------------
@@ -1840,22 +2026,23 @@ def fill_placeholders(prs, content, spec, slots, model):
         usable = cx / EMU - ins["l"] - ins["r"]
         capacity = box_line_capacity(cy, ins)
 
-        # box-driven content generation (per-point format; fill target + line cap
-        # come from the section's spec, defaulting to 70-85% of the box)
-        bullets, _tot, log = adaptive_bullets(
-            model, sec, usable, hang, ph["AI_content"], capacity)
+        bullets, _tot, log = gen_results[i]
 
         # headings / wheel tags
         if variant == "Wheel":
             tag_ph = spec["placeholders"]["wheel"]
+            focus_n = wheel_focus_index(slide)
+            focus_tag = slot.get("focus", "")
             shown = []
             for ti, tag in enumerate(content["wheel_tags"], start=1):
                 cfg = tag_ph.get(f"AI_tag_{ti}", tag_ph.get("AI_tag_1", {}))
                 tag_lines = wrap_to_lines(tag, cfg.get("max_chars_per_line", 18),
                                           cfg.get("max_lines", 2))
                 _fill_shape_text(slide, f"AI_tag_{ti}", tag_lines)
-                shown.append(" / ".join(tag_lines))
-            head_line = f"tags={shown}"
+                star = " <focus>" if ti == focus_n else ""
+                shown.append(" / ".join(tag_lines) + star)
+            head_line = (f"FOCUS (middle tag) = {focus_tag!r} [AI_tag_{focus_n}];  "
+                         f"tags={shown}")
         else:
             max_heading = ph["AI_title"]["max_chars"]
             heading = truncate(sec.get("heading", ""), max_heading, ellipsis=True)
@@ -1893,9 +2080,11 @@ def fill_placeholders(prs, content, spec, slots, model):
             print(f"        - {b}{mark}")
         summary.append((i + 1, variant, len(final_bullets), final_lines,
                         capacity, n_tech))
-        rep_title = " | ".join(shown) if variant == "Wheel" else heading
+        rep_title = (f"{slot.get('focus', '')} (focus)" if variant == "Wheel"
+                     else heading)
         report.append({"slide": i + 1, "type": variant, "title": rep_title,
                        "n": len(final_bullets), "unit": "bullets", "fill": fill_pct})
+        slide_times.append((i + 1, variant, time.time() - t_slide))
 
     print("\n=== SUMMARY: fill % and technical-line counts ===")
     for sidx, variant, nb, nlines, cap, ntech in summary:
@@ -1919,6 +2108,10 @@ def fill_placeholders(prs, content, spec, slots, model):
                   f"template slide {tmpl})")
     else:
         print("\n(no long-content slides needed for this deck)")
+
+    print("\n=== PER-SLIDE TIMING ===")
+    for sno, stype, dt in sorted(slide_times, key=lambda x: -x[2]):
+        print(f"   Slide {sno:>2} {stype:11}  {dt:.2f}s")
     return summary
 
 
@@ -1928,19 +2121,65 @@ def save_output(prs, output_path):
     return output_path
 
 
+# Filler words dropped when deriving a short topic slug for the download filename.
+# Verbs/articles/meta words a prompt wraps a topic in ("make a presentation about ...",
+# "explain the ...") so the slug is the actual subject, not the request boilerplate.
+_TOPIC_FILLER = {
+    "make", "create", "generate", "build", "design", "prepare", "produce", "write",
+    "give", "show", "do", "explain", "describe", "tell", "cover", "covering", "teach",
+    "a", "an", "the", "some", "my", "our", "your", "this", "that", "these", "those",
+    "presentation", "presentations", "slide", "slides", "deck", "slideshow",
+    "powerpoint", "ppt", "pptx", "talk", "lecture", "report", "overview",
+    "introduction", "intro", "about", "on", "of", "for", "to", "with", "in", "into",
+    "regarding", "concerning", "and", "or", "please", "me", "us", "using", "use",
+}
+
+
+def topic_slug(topic, max_words=2):
+    """Short lowercase_underscore slug naming the SUBJECT of a prompt, for filenames.
+
+    Strips request boilerplate ("make a presentation about ...") and keeps the first
+    `max_words` significant words, e.g.:
+      "make a presentation about machine learning algorithms" -> "machine_learning"
+      "The French Revolution causes and consequences"         -> "french_revolution"
+      "Digital marketing strategies for small businesses"     -> "digital_marketing"
+    Falls back to the first few raw words if everything is filler, and to "deck" if
+    the prompt is empty. Never returns special characters."""
+    words = re.findall(r"[a-z0-9]+", (topic or "").lower())
+    significant = [w for w in words if w not in _TOPIC_FILLER]
+    chosen = significant[:max_words] if len(significant) >= 2 else (significant or words)[:3]
+    return "_".join(chosen) if chosen else "deck"
+
+
+def output_filename(topic, template, max_len=40):
+    """Download filename '{topic}_{template}.pptx', lowercase with underscores and
+    no special characters, capped at `max_len` characters total (extension
+    included). The topic slug is trimmed first if the whole name is too long."""
+    template = re.sub(r"[^a-z0-9]+", "", (template or "template").lower()) or "template"
+    ext = ".pptx"
+    slug = topic_slug(topic)
+    stem = f"{slug}_{template}"
+    if len(stem) + len(ext) > max_len:
+        stem = stem[:max_len - len(ext)].rstrip("_") or template
+    return f"{stem}{ext}"
+
+
 def generate_ai_deck(template_name, topic, count, output_path=None):
     """End-to-end: load spec -> Gemini outline (Stage 1) -> route long-content
     sections onto slides 21/22 -> clone the planned slides -> Stage 2 fill
     (adaptive bullets, or plain multi-line blocks for long-content) -> save."""
+    total_start = time.time()
     folder = os.path.dirname(os.path.abspath(__file__))
     spec = load_spec(template_name)
     src = spec["_template_path"]
-    out = output_path or os.path.join(folder, f"output_{template_name}.pptx")
+    out = output_path or os.path.join(folder, output_filename(topic, template_name))
 
     seq = build_slide_sequence(count, spec)     # validates the count against spec
 
     model = load_gemini(folder)
+    t_stage1 = time.time()
     content = generate_content(topic, spec, seq, model)
+    print(f"\n[perf] Stage 1 (outline) took {time.time() - t_stage1:.2f}s")
 
     # Route needs_long_content sections onto the long-content template slides.
     slots = route_plan(seq, content["sections"], spec)
@@ -1955,6 +2194,7 @@ def generate_ai_deck(template_name, topic, count, output_path=None):
     # Generate the long blocks BEFORE cloning so an under-full one can be demoted
     # back to a normal Bars/Hexagon slide rather than sitting in a huge empty box.
     if n_long:
+        t_stage2a = time.time()
         print("\n=== STAGE 2a: long-content blocks (>=60% fill required) ===")
         for sno, action, used, cap in prefetch_long_content(
                 slots, spec, model, src, min_long):
@@ -1964,14 +2204,26 @@ def generate_ai_deck(template_name, topic, count, output_path=None):
                 print(f"      - slot: {step}")
         n_long = sum(1 for s in slots if s.get("is_long"))
         print(f"   -> {n_long} long-content slide(s) after fill check")
+        print(f"\n[perf] Stage 2a (long-content prefetch) took {time.time() - t_stage2a:.2f}s")
 
+    t_build = time.time()
     build_deck_from_slots(slots, src, out)
     prs = Presentation(out)
+    print(f"\n[perf] Deck cloning + assembly took {time.time() - t_build:.2f}s")
 
-    fill_placeholders(prs, content, spec, slots, model)
+    t_stage2 = time.time()
+    fill_placeholders(prs, content, spec, slots, model, topic)
+    print(f"\n[perf] Stage 2 (fill all placeholders) took {time.time() - t_stage2:.2f}s")
 
+    t_save = time.time()
     save_output(prs, out)      # save BEFORE reporting: a printing failure must
+    print(f"[perf] Save took {time.time() - t_save:.2f}s")
     print_inserted(prs)        # never cost a deck that is already complete
+
+    total_end = time.time()
+    print(f"\n{'=' * 62}")
+    print(f"[perf] TOTAL EXECUTION TIME: {total_end - total_start:.2f}s")
+    print(f"{'=' * 62}")
     return out
 
 
