@@ -98,6 +98,8 @@ GEMINI_MODELS = ["gemini-2.0-flash", "gemini-flash-latest", "gemini-2.5-flash",
 QUOTA_RETRY_CAP = 45.0                      # max seconds to wait on a rate-limit
 MAX_QUOTA_WAITS = 2                         # wait+retry attempts on the last model
 API_CALL_DELAY = 1.0                        # seconds between calls (rate limiting)
+TRANSIENT_RETRY_DELAY = 3.0                 # short wait before retrying a 5xx/timeout
+MAX_TRANSIENT_WAITS = 2                     # retries on a transient server error
 
 # Bundled fonts live next to this file in ./fonts/, so measurements are
 # identical on Windows, macOS, and Linux (no dependency on system fonts).
@@ -198,19 +200,41 @@ def bul(text):
 _BULLET_MARK = "•‣◦⁃∙–—*\\-"   # • ‣ ◦ ⁃ ∙ – — * -
 _BULLET_INLINE_RE = re.compile(r"^\s*[" + _BULLET_MARK + r"][ \t]+")
 _BULLET_INDENT_RE = re.compile(r"^(\s*)[" + _BULLET_MARK + r">][ \t]+(.*)$")
+# Numbered-list marker Gemini sometimes emits despite being asked for bullets:
+# "1. ", "2) ", "10. ". Requiring a '.'/')' AND trailing whitespace keeps real
+# content safe -- "1990 was...", "10 rules", "2.0 flash", "3-tier" are NOT matched
+# (no dot/paren before the space, or no space after). We never number bullet boxes.
+_NUMBER_MARK_RE = re.compile(r"^\s*\d{1,2}[.)][ \t]+")
 
 
 def strip_bullet_prefix(text):
-    """Remove leading list markers from a bullet string (repeatedly, to catch
-    "* - foo"). Leading indentation is not meaningful for bullets, so it is
+    """Remove leading list markers -- bullet symbols AND numbered-list numbers
+    ("1.", "2)") -- from a bullet string, repeatedly (to catch "1. - foo" or
+    "* * foo"). Leading indentation is not meaningful for bullets, so it is
     dropped. Use this for AI_content bullets before bul() re-adds the single dot."""
     s = (text or "").strip()
-    for _ in range(3):
+    for _ in range(4):
         new = _BULLET_INLINE_RE.sub("", s, count=1)
+        new = _NUMBER_MARK_RE.sub("", new, count=1)
         if new == s:
             break
         s = new.strip()
     return s
+
+
+def _norm_heading(s):
+    """Alphanumeric-only lowercase form, for comparing a bullet to a heading."""
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def drop_heading_echo(bullets, heading):
+    """Remove any bullet that merely restates the slide heading/focus, so the
+    heading never appears both as the title and as the first content line
+    (e.g. heading "Incident Response" + first bullet "Incident Response")."""
+    h = _norm_heading(heading)
+    if not h:
+        return bullets
+    return [b for b in bullets if _norm_heading(b) != h]
 
 
 def strip_long_bullet(line):
@@ -927,12 +951,15 @@ Build a NATURAL NARRATIVE FLOW that fits THIS specific topic. Every presentation
 6. MAKE SECTIONS CONNECT -- each new section should logically follow from the previous
    one, so the reader feels a story unfolding, not a random list of facts.
 
-Add examples where they help -- a formula, an equation, a syntax/code snippet, a short
-calculation, or a concrete case -- whenever the point calls for it. ANY subject may need
-these: business has ROI and break-even formulas, biology has growth equations, economics
-has calculations, programming has code/syntax. Do NOT assume the subject has or lacks
-technical content; that is decided per point in the next stage. Here, just plan headings
-and per-slide topics so the flow is coherent.
+MATCH THE COMPLEXITY TO THE TOPIC. Default to a clear, plain-language explanation that a
+general audience can follow. Use formulas, equations, code, or syntax ONLY when the
+subject genuinely needs them -- programming, mathematics, engineering, the hard sciences,
+or quantitative finance -- OR when the user's request explicitly asks for that technical
+content. For general, theoretical, historical, or business-overview topics (e.g.
+cybersecurity awareness, marketing, history, management), plan PLAIN descriptive slides
+with NO formulas or code. When unsure, prefer plain language. The actual per-point wording
+happens in the next stage; here, just plan headings and topics so the flow is coherent and
+introduce the subject gently before going deep.
 
 The specific sections depend ENTIRELY on the topic -- do NOT force a template. For a
 technical topic you might go concepts -> categories -> examples -> applications. For a
@@ -974,8 +1001,8 @@ leave needs_long_content false and let it be a normal Bar/Hexagon slide.
 
 Return ONLY a JSON object, no markdown, no explanation:
 {
-  "title": "short title, max 20 chars",
-  "subtitle": "subtitle, max 30 chars",
+  "title": "the topic's real, complete name -- short (a few words), never abbreviated",
+  "subtitle": "short supporting line",
   "wheel_tags": ["pillar1", "pillar2", "pillar3"],
   "sections": [
     {"type": "wheel", "variant": 1, "heading": "max 14 chars", "topic": "define ONLY this pillar", "needs_long_content": false},
@@ -985,8 +1012,10 @@ Return ONLY a JSON object, no markdown, no explanation:
 }
 
 Rules:
-- title max 20 characters
-- subtitle max 30 characters
+- title: the topic's real, complete name (e.g. "Model View Controller", not "Model
+  View Contro..."). Keep it to a few words, but NEVER abbreviate, cut, or add "..." --
+  it is shown in full on the slide. Aim for under ~30 characters.
+- subtitle: one short supporting line, aim for under ~40 characters, not abbreviated
 - bar and hexagon headings max 25 characters (must fit on ONE line)
 - wheel_tags are the 3 pillars shown on the wheel; each may wrap to 2 lines, so up to
   about 36 characters total (max 18 per line). Prefer short labels, but full words
@@ -1002,6 +1031,7 @@ Rules:
 
 STAGE2_PROMPT = """Write the on-slide content for ONE presentation slide.
 
+Overall presentation topic (the user's request): {overall_topic}
 THIS SLIDE'S FOCUS (discuss ONLY this): {focus}
 Topic of this slide: {section.topic}
 Heading: {section.heading}
@@ -1014,12 +1044,21 @@ Continuity (for context only -- do NOT write about these):
 Stay STRICTLY on this slide's focus/heading. Write only about "{focus}". Do not discuss
 what other slides cover, and do not turn this into an overview of the whole topic.
 
-For each point, choose the clearest way to present it. Use bullets for descriptive
-information. If a specific point is best explained with a formula, equation, code
-snippet, calculation, or short example, include that directly instead of just describing
-it. This applies to ANY subject -- business, biology, economics, programming, chemistry,
-etc. Do not assume a subject has or lacks technical content; decide from the actual point
-being made.
+Every line must be a plain bullet of real content. HARD RULES:
+- Do NOT repeat the heading/focus ("{focus}") as a line. The FIRST line must be actual
+  content, never the heading restated.
+- Do NOT number the lines. No "1.", "2)", "Step 1", etc. -- these are bullets, not a
+  numbered list. Never mix numbering with bullets.
+- Write each line as a clean descriptive phrase.
+
+MATCH COMPLEXITY TO THE TOPIC. Default to clear, plain-language bullets that a general
+audience understands. Include a formula, equation, code snippet, syntax, or calculation
+ONLY when the subject genuinely needs it -- programming, mathematics, engineering, the
+hard sciences, quantitative finance -- OR when the user's overall request explicitly asks
+for that technical content. For general, theoretical, historical, or business/overview
+topics (e.g. cybersecurity awareness, marketing, history), use PLAIN bullets with NO
+formulas or code. When in doubt, keep it plain. Decide from the overall topic above, not
+from a habit of adding math.
 
 The box is the ONLY hard constraint:
 - Each line must fit on ONE line in the box: at most about {max_chars} characters.
@@ -1031,9 +1070,11 @@ The box is the ONLY hard constraint:
   than removing the point.{extra}
 
 Style:
-- Descriptive lines: clean concrete phrases, start with a capital, no trailing period.
-- Formulas / equations / code / calculations: write them in their natural form --
-  symbols, operators, and numbers are expected (e.g. "ROI = (Gain - Cost) / Cost * 100").
+- Descriptive lines: clean concrete phrases, start with a capital, no trailing period,
+  no leading bullet character or number.
+- Formulas / equations / code / calculations (ONLY when the topic warrants them, per the
+  rule above): write them in their natural form -- symbols, operators, and numbers are
+  expected (e.g. "ROI = (Gain - Cost) / Cost * 100").
 
 Return ONLY a JSON object, no markdown, no explanation:
 {
@@ -1042,11 +1083,18 @@ Return ONLY a JSON object, no markdown, no explanation:
 
 STAGE2_LONG_PROMPT = """Write the FULL-DETAIL content for ONE large presentation slide.
 
+Overall presentation topic (the user's request): {overall_topic}
 Topic of this slide: {section.topic}
 Heading: {section.heading}
 
 Stay STRICTLY on this slide's heading/topic. Do not drift into material that belongs on
 other slides; this one block is about "{section.heading}" only.
+
+MATCH COMPLEXITY TO THE TOPIC. Use code, formulas, or step-by-step math ONLY when the
+subject genuinely needs them (programming, mathematics, engineering, the hard sciences,
+quantitative finance) or the user's overall request explicitly asks for it. For general,
+theoretical, historical, or business/overview topics, write a detailed explanatory
+PARAGRAPH in plain prose instead of code or formulas.
 
 This slide has a MASSIVE box (10.9 inches wide, 5 inches tall). It exists because the
 point needs a big block that does NOT work as short bullets -- a full code example (a
@@ -1108,6 +1156,19 @@ def _is_unavailable_error(exc):
             or "no longer available" in s or "not supported" in s)
 
 
+def _is_transient_error(exc):
+    """True if `exc` is a transient server-side failure that should be retried --
+    a 5xx or a deadline/timeout (e.g. "504 Deadline Exceeded"). These are NOT the
+    model's fault, so a brief wait + retry (then a model fallback) recovers instead
+    of leaving a slide empty."""
+    s = f"{type(exc).__name__}: {exc}".lower()
+    return ("deadline exceeded" in s or "deadlineexceeded" in s
+            or "504" in s or "503" in s or "502" in s
+            or "service unavailable" in s or "serviceunavailable" in s
+            or "internal error" in s or "internal server error" in s
+            or "500 " in s or "timeout" in s or "timed out" in s)
+
+
 def _retry_seconds(exc):
     """Seconds the API suggests waiting before retrying (from a 429), or None."""
     s = f"{exc}"
@@ -1144,6 +1205,7 @@ class _FallbackModel:
                 quota_delay = None
                 with self._lock:
                     skip = _is_quota_error(exc) or _is_unavailable_error(exc)
+                    transient = _is_transient_error(exc)
                     if skip and self._i != model_idx:
                         waits = 0
                     elif skip and self._i + 1 < len(self._names):
@@ -1161,6 +1223,22 @@ class _FallbackModel:
                         print(f"    [quota] {self.name} rate-limited; waiting "
                               f"{quota_delay:.0f}s then retrying "
                               f"({waits}/{MAX_QUOTA_WAITS})")
+                    elif transient and waits < MAX_TRANSIENT_WAITS:
+                        # 5xx / deadline / timeout: not the model's fault. Wait a
+                        # little and retry the SAME model before giving up.
+                        quota_delay = TRANSIENT_RETRY_DELAY
+                        waits += 1
+                        print(f"    [transient] {self.name}: {type(exc).__name__} "
+                              f"({exc}); waiting {quota_delay:.0f}s then retrying "
+                              f"({waits}/{MAX_TRANSIENT_WAITS})")
+                    elif transient and self._i + 1 < len(self._names):
+                        # Retries exhausted on this model -- try the next one.
+                        old = self._names[self._i]
+                        self._i += 1
+                        print(f"    [transient] {old} still failing -> falling back "
+                              f"to {self._names[self._i]}")
+                        self._model = self._genai.GenerativeModel(self._names[self._i])
+                        waits = 0
                     else:
                         raise
                 time.sleep(quota_delay if quota_delay is not None
@@ -1225,7 +1303,7 @@ def gemini_json(model, prompt, retries=1):
 
 def stage2_bullets(model, section, max_chars, capacity, target_min, target_max, rn,
                    fill_lo_pct=70, fill_hi_pct=85, extra="",
-                   focus="", prev_topic="", next_topic=""):
+                   focus="", prev_topic="", next_topic="", overall_topic=""):
     """Ask Gemini for the slide's content lines. Each returned line is whatever
     best communicates that point -- a bullet, a formula, a code line, or a short
     calculation -- constrained only by the box (max_chars per line, ~capacity
@@ -1238,7 +1316,9 @@ def stage2_bullets(model, section, max_chars, capacity, target_min, target_max, 
     focus = focus or section.get("focus_tag") or section.get("heading", "")
     prev_topic = (prev_topic or "").strip() or "(nothing -- this is the first content slide)"
     next_topic = (next_topic or "").strip() or "(nothing -- this is the last content slide)"
+    overall_topic = (overall_topic or "").strip() or "(a general audience)"
     prompt = (STAGE2_PROMPT
+              .replace("{overall_topic}", overall_topic)
               .replace("{focus}", str(focus))
               .replace("{prev_topic}", prev_topic)
               .replace("{next_topic}", next_topic)
@@ -1258,11 +1338,14 @@ def stage2_bullets(model, section, max_chars, capacity, target_min, target_max, 
     return data.get("lines") or data.get("bullets") or []
 
 
-def stage2_long_content(model, section, max_lines, max_chars, min_lines=1):
+def stage2_long_content(model, section, max_lines, max_chars, min_lines=1,
+                        overall_topic=""):
     """Ask Gemini for the full multi-line block for a long-content slide (code,
     derivation, algorithm, or paragraph). Returns the block as a single string
     with '\\n' line breaks and literal-space indentation preserved."""
+    overall_topic = (overall_topic or "").strip() or "(a general audience)"
     prompt = (STAGE2_LONG_PROMPT
+              .replace("{overall_topic}", overall_topic)
               .replace("{section.topic}", str(section.get("topic", "")))
               .replace("{section.heading}", str(section.get("heading", "")))
               .replace("{min_lines}", str(min_lines))
@@ -1402,7 +1485,7 @@ def _content_extra(spec_cfg, line_cap):
 
 
 def adaptive_bullets(model, section, usable_in, hang_in, ph_content_spec, capacity,
-                     focus="", prev_topic="", next_topic=""):
+                     focus="", prev_topic="", next_topic="", overall_topic=""):
     """Generate the slide's content lines, filling a target fraction of the box.
 
     `focus` is the single thing the slide must discuss (wheel middle tag or
@@ -1445,11 +1528,14 @@ def adaptive_bullets(model, section, usable_in, hang_in, ph_content_spec, capaci
             raw = stage2_bullets(model, section, max_chars, capacity,
                                  target_min, target_max, rn,
                                  fill_lo_pct, fill_hi_pct, extra,
-                                 focus, prev_topic, next_topic)
-        except Exception as exc:  # noqa: BLE001 - reported, then fall back
+                                 focus, prev_topic, next_topic, overall_topic)
+        except Exception as exc:  # noqa: BLE001 - reported, then retry
+            # Don't abandon the whole slide on one failure: a transient error
+            # (e.g. 504) can clear on the next attempt, and the model may have
+            # fallen back to a working one. Keep trying within MAX_BULLET_ITERS.
             log.append(f"try{attempt + 1}: gen FAILED: {exc}")
             time.sleep(API_CALL_DELAY)
-            break
+            continue
         time.sleep(API_CALL_DELAY)
         items = [strip_bullet_prefix(x) for x in raw if isinstance(x, str)]
         items = [x for x in items if x]         # drop marker-only / empty lines
@@ -1688,7 +1774,7 @@ def trim_to_box_height(shape, lines):
 
 
 def generate_long_body(model, section, usable_in, capacity, max_lines, max_chars,
-                       min_lines):
+                       min_lines, overall_topic=""):
     """Generate a long-content block that both FILLS the box (>= min_lines display
     lines) and FITS it complete (nothing trimmed). Under-full -> ask for more;
     over-long -> ask for less, since a trimmed block ends mid-sentence or
@@ -1699,7 +1785,8 @@ def generate_long_body(model, section, usable_in, capacity, max_lines, max_chars
     ask_min, ask_max, ask_chars = min_lines, max_lines, max_chars
     for attempt in range(MAX_LONG_ITERS):
         try:
-            body = stage2_long_content(model, section, ask_max, ask_chars, ask_min)
+            body = stage2_long_content(model, section, ask_max, ask_chars, ask_min,
+                                       overall_topic)
         except Exception as exc:  # noqa: BLE001 - reported, then keep what we have
             log.append(f"try{attempt + 1}: gen FAILED: {exc}")
             break
@@ -1734,7 +1821,7 @@ def generate_long_body(model, section, usable_in, capacity, max_lines, max_chars
     return best, best_used, log
 
 
-def prefetch_long_content(slots, spec, model, src_path, min_long):
+def prefetch_long_content(slots, spec, model, src_path, min_long, overall_topic=""):
     """Generate every long-content block BEFORE the deck is cloned, so a slot whose
     content comes back bullet-sized can be demoted back to a normal Bars/Hexagon
     slide instead of leaving a mostly-empty huge box. Boxes are measured on the
@@ -1752,7 +1839,8 @@ def prefetch_long_content(slots, spec, model, src_path, min_long):
         tmpl_shape = find_shape(prs.slides[slot["tmpl_idx"] - 1], "AI_content")
         usable, cap, max_lines, max_chars, min_lines = long_box_spec(spec, tmpl_shape)
         kept, used, log = generate_long_body(model, slot["section"], usable, cap,
-                                             max_lines, max_chars, min_lines)
+                                             max_lines, max_chars, min_lines,
+                                             overall_topic)
         slot["long_log"] = log
         underfull = used < min_lines
         # Rule: never leave bullet-sized content in a long box -- demote, unless
@@ -1772,7 +1860,8 @@ def prefetch_long_content(slots, spec, model, src_path, min_long):
     return notes
 
 
-def fill_long_content(slide, section, spec, model, slide_w_in, body=None):
+def fill_long_content(slide, section, spec, model, slide_w_in, body=None,
+                      overall_topic=""):
     """Fill a long-content slide (21/22): a short AI_title heading plus AI_content
     as PLAIN multi-line text (no bullets), preserving line breaks and leading
     indentation, trimmed to what the large box can hold. `body` is the block from
@@ -1800,7 +1889,8 @@ def fill_long_content(slide, section, spec, model, slide_w_in, body=None):
     # 3) Generate if needed, trim to the box (with an absolute height backstop),
     #    and write as plain multi-line text (fill_simple adds no bullet).
     if body is None:
-        body = stage2_long_content(model, section, max_lines, max_chars, min_lines)
+        body = stage2_long_content(model, section, max_lines, max_chars, min_lines,
+                                   overall_topic)
         time.sleep(API_CALL_DELAY)
     kept, used, _dropped = measure_long_body(body, usable, capacity)
     kept, used = trim_to_box_height(content_shape, kept)
@@ -1859,14 +1949,17 @@ def generate_content(topic, spec, sequence, model):
     outline = gemini_json(model, p1)
     time.sleep(API_CALL_DELAY)
 
-    # One-line headings: truncate over-limit text with a trailing "..." .
-    title = truncate(outline.get("title", ""), max_title, ellipsis=True)
-    subtitle = truncate(outline.get("subtitle", ""), max_subtitle, ellipsis=True)
+    # The START-slide title/subtitle are shown IN FULL -- the box wraps (wrap=square)
+    # and auto-fits, so a real name like "Model View Controller" must never be cut.
+    # (Only the download FILE name is shortened, elsewhere.) Content-slide headings and
+    # wheel tags are still length-limited because their boxes are fixed one-liners.
+    title = (outline.get("title") or "").strip()
+    subtitle = (outline.get("subtitle") or "").strip()
     wheel_tags = [truncate(t, max_tag) for t in
                   (outline.get("wheel_tags") or [])][:wheel_count]
     sections = outline.get("sections") or []
-    print(f"  title     : {title!r}  ({len(title)} chars, <= {max_title})")
-    print(f"  subtitle  : {subtitle!r}  ({len(subtitle)} chars, <= {max_subtitle})")
+    print(f"  title     : {title!r}  ({len(title)} chars, shown in full)")
+    print(f"  subtitle  : {subtitle!r}  ({len(subtitle)} chars, shown in full)")
     print(f"  wheel_tags: {wheel_tags}")
     print(f"  sections  : {len(sections)} (need {content_slide_count})")
     for s in sections:
@@ -1960,7 +2053,7 @@ def fill_placeholders(prs, content, spec, slots, model, topic=""):
         futures = {}
         for idx, (sec_p, us_p, phc_p, cap_p, foc_p, prev_p, next_p) in gen_tasks.items():
             f = pool.submit(adaptive_bullets, model, sec_p, us_p, hang,
-                            phc_p, cap_p, foc_p, prev_p, next_p)
+                            phc_p, cap_p, foc_p, prev_p, next_p, topic)
             futures[f] = idx
         for f in as_completed(futures):
             gen_results[futures[f]] = f.result()
@@ -1997,7 +2090,8 @@ def fill_placeholders(prs, content, spec, slots, model, topic=""):
         # ---- LongContent slot: plain multi-line block, no bullets -----------
         if slot.get("is_long"):
             heading, kept, used, cap, n_tech = fill_long_content(
-                slide, sec, spec, model, slide_w_in, body=slot.get("long_body"))
+                slide, sec, spec, model, slide_w_in, body=slot.get("long_body"),
+                overall_topic=topic)
             long_routed.append((i + 1, slot.get("orig_kind", "?"),
                                 heading, slot["tmpl_idx"]))
             fill_pct = (100.0 * used / cap) if cap else 0.0
@@ -2027,6 +2121,8 @@ def fill_placeholders(prs, content, spec, slots, model, topic=""):
         capacity = box_line_capacity(cy, ins)
 
         bullets, _tot, log = gen_results[i]
+        # Never let the heading/focus echo as the first content line.
+        bullets = drop_heading_echo(bullets, slot.get("focus", ""))
 
         # headings / wheel tags
         if variant == "Wheel":
@@ -2197,7 +2293,7 @@ def generate_ai_deck(template_name, topic, count, output_path=None):
         t_stage2a = time.time()
         print("\n=== STAGE 2a: long-content blocks (>=60% fill required) ===")
         for sno, action, used, cap in prefetch_long_content(
-                slots, spec, model, src, min_long):
+                slots, spec, model, src, min_long, topic):
             print(f"   slide {sno:2}: {action}  [{used}/{cap} lines]")
         for slot in slots:
             for step in slot.get("long_log", []):
